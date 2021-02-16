@@ -26,14 +26,20 @@ gutcontent2 <- read.csv("/Users/pascalecaissy/Dropbox/MSc 2019-2020/bosaFS/gutco
 gutcontent2$prey_id_comb <- with(gutcontent2, ifelse( prey_reass %in% c("triconia borealis c", "oithona similis c", "onceaidae sp c", "oncea sp c", "cyclopoid sp c"), "cyclopoidae sp c", 
                                   ifelse( prey_reass %in% c("appendicularian sp", "fritillaria sp", "oikopleura sp"), "appendicularia", 
                                          ifelse( prey_reass %in% c("calanus sp n", "calanus glacialis n"), "calanus sp n",
-                                                ifelse(prey_reass %in% c("calanoid sp", "calanoid sp c", "heterorhabdus norvegicus c", "metridia longa c", "chiridus sp c", "acartia sp c", "eurytemora sp c", "pseudocalanus sp/acartia sp c", "paraheterorhabdus compactus c", "paraeuchaeta sp c", "scolecithricella sp c", "spinocalanus sp c", "microcalanus sp c"), "calanoid sp c", 
-                                                       ifelse(prey_reass %in% c("calanoid sp n", "acartia sp n", "pseudocalanus sp/metridia longa n", "metridia longa n", "cyclopoid n", "microcalanus sp n", "microcalanus sp  n", "oithona similis n", "cyclopoid sp n", "unknown n"), "other copepodite n", 
+                                                ifelse(prey_reass %in% c("calanoid sp", "calanoid sp c", "heterorhabdus norvegicus c", "metridia longa c", "chiridus sp c", "acartia sp c", "eurytemora sp c", "pseudocalanus sp/acartia sp c", "paraheterorhabdus compactus c", "paraeuchaeta sp c", "scolecithricella sp c", "spinocalanus sp c", "microcalanus sp c"), "other calanoid sp c", #calanoid line 
+                                                       ifelse(prey_reass %in% c("calanoid sp n", "acartia sp n", "pseudocalanus sp/metridia longa n", "metridia longa n", "cyclopoid n", "microcalanus sp n", "microcalanus sp  n", "oithona similis n", "cyclopoid sp n", "unknown n"), "other copepodite and n", 
                                                               ifelse(prey_reass %in% c("egg","egg sack"), "egg",
                                                                             ifelse(prey_reass %in% c("fecal pellet","radiolarian sp","vers", "unknown", "chaetognath sp", "vertebrae", "trematoda sp", "parasite","polychaetae larvae", "digested matter", "crustacea sp meta", "amphipod sp", "decapoda sp meta", "euphausiacea sp", "decapoda sp", "boroecia maxima", "cirripedia sp", "cirripedia sp n", "podon sp", "coscinodiscus sp"), "other",
-                                                                                   ifelse(prey_reass %in% c("unknown c", "harpacticoid sp c", "unknown nc"),"other copepodite sp",
-                                                                                                 ifelse(prey_reass %in% c("calanus sp c", "calanus finmarchicus c"), "calanus sp c", 
-                                                                                                               as.character(prey_reass)))))))))))
+                                                                                   ifelse(prey_reass %in% c("unknown c", "harpacticoid sp c", "unknown nc"),"other copepodite and n",
+                                                                                                 ifelse(prey_reass %in% c("calanus sp c", "calanus finmarchicus c", "calanus hyperboreus c"), "other calanus sp c", 
+                                                                                                        ifelse(prey_reass %in% c("bivalve larvae","limacina helicina"), "other", #avant étaient séparés,puis mis dans mollusca, mais finalement c'Est vraiment un apport très faible
+                                                                                                               as.character(prey_reass))))))))))))
+#méthode de catégorisation: utiliser d'abord la taxonomie pour regrouper ensemble. Vérifier à la fois l'apport en nombre et en %carbone pour chaque catégorie. Rassemblé dans une autre catégorie quand représente -1% carbone et -5% du nombre de proies.
+table(gutcontent2$prey_reass)/24646
+tapply(gutcontent2$carbon_mg, INDEX = list(gutcontent2$prey_reass), FUN = sum, na.rm = TRUE)/sum(gutcontent2$carbon_mg, na.rm = TRUE)
 
+table(gutcontent2$prey_id_comb)/24646
+tapply(gutcontent2$carbon_mg, INDEX = list(gutcontent2$prey_id_comb), FUN = sum, na.rm = TRUE)/sum(gutcontent2$carbon_mg, na.rm = TRUE)
 ```
 
 # Section 1 Conditions environnementales régionales
