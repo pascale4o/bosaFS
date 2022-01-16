@@ -1,0 +1,1189 @@
+---
+title: "bosaFS analyses LMER"
+author: "Pascale Caissy"
+date: '2022-01-15'
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+library("tidyverse")
+library("data.table")
+library("FactoMineR")
+library("ggplot2")
+library("ggfortify")
+library("reshape2")
+library("lmerTest")
+library("sjPlot")
+library("vegan")
+library("Hmisc")
+library("cowplot")
+library("lattice")
+library("car")
+library("performance")
+
+options(scipen = 99999999)
+```
+
+# Préparation des données  
+
+&nbsp;
+
+We first categorisez preys::  
+
+* We first use taxonomy to make initial groupings;  
+
+* We verify contributions in *numbers* and in *% carbon* for each category;  
+
+* We merged groups into an *other* category when they represented <1% of carbon and <5% of prey number.
+
+```{r prey matrix, echo = FALSE}
+dfish <- read.csv("/Users/pascalecaissy/Dropbox/MSc 2019-2020/bosaFS/fish_data_PC_20210107.csv", check.names = FALSE ) %>% select(-1)
+
+gutcontent2              <- read.csv("/Users/pascalecaissy/Dropbox/MSc 2019-2020/bosaFS/gutcontent_bosa_carbon20210121.csv") %>% select(-X,-X.1)
+gutcontent2$prey_id_comb <- with( gutcontent2, 
+                                  ifelse( prey_reass %in% c("triconia borealis c", "oithona similis c", "onceaidae sp c", "oncea sp c", "cyclopoid sp c"), 
+                                          "cyclopoidae sp c", 
+                                          ifelse( prey_reass %in% c("appendicularian sp", "fritillaria sp", "oikopleura sp"), 
+                                                  "appendicularia", 
+                                                  ifelse( prey_reass %in% c("calanus sp n", "calanus glacialis n"), 
+                                                          "calanus sp n",
+                                                          ifelse(prey_reass %in% c("calanoid sp", "calanoid sp c", "heterorhabdus norvegicus c", "metridia longa c", "chiridus sp c", "acartia sp c", "eurytemora sp c", "pseudocalanus sp/acartia sp c", "paraheterorhabdus compactus c", "paraeuchaeta sp c", "scolecithricella sp c", "spinocalanus sp c", "microcalanus sp c"), 
+                                                                 "other calanoid sp c",
+                                                                 ifelse(prey_reass %in% c("calanoid sp n", "acartia sp n", "pseudocalanus sp/metridia longa n", "metridia longa n", "cyclopoid n", "microcalanus sp n", "microcalanus sp  n", "oithona similis n", "cyclopoid sp n", "unknown n"), 
+                                                                        "other copepodite and n", 
+                                                                        ifelse(prey_reass %in% c("egg","egg sack"), 
+                                                                               "egg",
+                                                                               ifelse(prey_reass %in% c("fecal pellet","radiolarian sp","vers", "unknown", "chaetognath sp", "vertebrae", "trematoda sp", "parasite","polychaetae larvae", "digested matter", "crustacea sp meta", "amphipod sp", "decapoda sp meta", "euphausiacea sp", "decapoda sp", "boroecia maxima", "cirripedia sp", "cirripedia sp n", "podon sp", "coscinodiscus sp"),
+                                                                                      "other",
+                                                                                      ifelse(prey_reass %in% c("unknown c", "harpacticoid sp c", "unknown nc"),
+                                                                                             "other copepodite and n",
+                                                                                             ifelse(prey_reass %in% c("calanus sp c", "calanus finmarchicus c", "calanus hyperboreus c"),
+                                                                                                    "other calanus sp c", 
+                                                                                                    ifelse(prey_reass %in% c("bivalve larvae","limacina helicina"), 
+                                                                                                           "other", as.character(prey_reass) ) ) ) ) ) ) ) ) ) ) )
+
+#--- Preliminary graphs
+
+barplot( sort( table( gutcontent2$prey_id_comb ), decreasing = TRUE ) / 
+          sum( table( gutcontent2$prey_id_comb ) ),
+         main = "Abundance"
+        ) 
+abline(h = 0.05, col = "lightblue")
+abline(h = 0.01, col="red")
+
+barplot( sort( tapply( gutcontent2$carbon_mg, 
+                       INDEX = list(gutcontent2$prey_id_comb), 
+                       FUN   = sum, 
+                       na.rm = TRUE ),
+               decreasing = TRUE ) / 
+         sum( gutcontent2$carbon_mg, na.rm = TRUE ),
+         main = "Carbon %"
+        )
+abline(h = 0.05, col = "lightblue")
+abline(h = 0.01, col="red")
+```
+
+&nbsp;
+
+Data preparation per sampling region
+
+```{r prep données, echo = FALSE}
+#--- Add dates in julian days
+
+jul.conv <- function(x) { 
+  J <- julian( x, as.Date( paste0(format(x,"%Y"),"-01-01") ) )
+  return( J[1] )
+}
+
+dfish$sampling_day <- dfish$sampling_date      %>%
+                      as.Date( ., "%Y-%m-%d" ) %>%
+                      sapply( ., jul.conv )
+
+#--- Regions
+#    Beaufort Sea: Mackenzie Shelf, Amundsen Gulf Maud
+#    Kitikmeot   : Coronation Maud, Larsen Sound, Peel Sound
+#    Baffin Bay  : North Water, Lancaster Sound, NW Baffin Bay
+
+dfish$province <- with( dfish, ifelse( region %in% c("Mackenzie Shelf","Amundsen Gulf Mouth"), 
+                                       "Beaufort Sea",
+                                       ifelse( region %in% c("Coronation Maud","Larsen Sound - Victoria Strait","Peel Sound"), 
+                                               "Kitikmeot",
+                                               ifelse( region == "NEG", 
+                                                       "Greenland Sea",
+                                                       "NW Baffin Bay" ) ) ) )
+
+reg_initials <- data.frame( region   = levels(dfish$region), 
+                            initials = c( "AGM", "CM", "LS", "LV", "MS", "NEG", "NW", "PS", "WBB" ) )
+
+dfish             <- merge( dfish, reg_initials )
+dfish$region_year <- as.factor( paste( dfish$initials, dfish$year ) ) %>%
+                     ordered( ., levels = c( "MS 2009" ,"MS 2010" ,"MS 2014" ,"MS 2015",
+                                             "AGM 2015", 
+                                             "CM 2011" ,"CM 2016" ,"CM 2017" ,"CM 2018",
+                                             "LV 2010" , "LV 2016","LV 2018" ,
+                                             "PS 2010" ,"PS 2011" ,"PS 2014" ,"PS 2015","PS 2016",
+                                             "LS 2010" ,"LS 2011" ,"LS 2015" ,"LS 2016","LS 2017",
+                                             "NW 2014" ,"NW 2016" , "NW 2018",
+                                             "WBB 2015","WBB 2016",
+                                             "NEG 2017" )
+                            )
+
+dfish$region <- as.factor(dfish$region) %>% ordered(., levels = c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+
+###
+
+gutcontent2$sampling_day <- gutcontent2$sampling_date %>%
+                            as.Date( ., "%Y-%m-%d" )  %>%
+                            sapply( ., jul.conv )
+gutcontent2              <- merge( gutcontent2, reg_initials )
+gutcontent2$region_year  <- as.factor( paste( gutcontent2$initials, gutcontent2$year ) )
+dfish$total_preys <- rowSums(dfish[,c(23:86)])
+prey_matrix_comb2 <- dcast( setDT(gutcontent2), unique_fish_id ~ prey_id_comb, length )  %>% 
+                     merge( ., dfish[ , c("unique_fish_id",
+                                          "region_year",
+                                          "region",
+                                          "station",
+                                          "open_water_day",
+                                          "surf_sal_kgm3",
+                                          "surf_temp_degC",
+                                          "NASC_zoo",
+                                          "indstandard",
+                                          "prof_mel",
+                                          "est_standard_length",
+                                          "fish_cond",
+                                          "feeding_success",
+                                          "prey_max_um",
+                                          "prey_min_um",
+                                          "prey_median_um",
+                                          "prey_range_um",
+                                          "total_preys"
+                                           ) ] ) 
+                     
+station_data <- dfish %>% aggregate( data = ., 
+                            unique_fish_id ~ region         + 
+                                             station        +
+                                             surf_temp_degC +
+                                             surf_sal_kgm3  +
+                                             open_water_day +
+                                             NASC_zoo       +
+                                             indstandard,
+                            length )
+```
+
+&nbsp;
+
+# Preliminary exploration
+&nbsp;
+
+
+#Question 1. Feeding success (FS) ~ size + environnement
+
+&nbsp;
+
+For size specifically, we will log-transformed variables.
+
+We will do the same with feeding success (`feeding_success`).  
+
+&nbsp;
+
+```{r explo Question 2 poissons}
+
+#--- Adding log-transformed values
+
+dfish$log_carbon_mg           <- log10( dfish$carbon_mg )
+dfish$log_est_standard_length <- log10( dfish$est_standard_length )
+dfish$log_feeding_success     <- log10( dfish$feeding_success )
+
+
+#--- Fish size
+
+# Regional distribution
+par( mar = c(6,4,0,0) )
+plot( log_est_standard_length ~ region, 
+      data = dfish,
+      xlab = "",
+      las  = 2 )
+
+# Sampling spatio-temporal coverage
+tapply( dfish$est_standard_length,
+        INDEX = list( dfish$region, dfish$year ), 
+        FUN   = mean )
+
+
+#--- Size and environment
+
+dfish %>% select( log_est_standard_length,
+                  sampling_day,
+                  open_water_day,
+                  prof_mel,
+                  surf_sal_kgm3,
+                  surf_temp_degC,
+                  NASC_zoo ) %>% plot
+
+# Correlations with potential explanatory variables
+rcorr( as.matrix( dfish[, c( "log_est_standard_length",
+                             "sampling_day",
+                             "open_water_day",
+                             "prof_mel",
+                             "surf_sal_kgm3",
+                             "surf_temp_degC",
+                             "NASC_zoo" ) ]
+                 ) 
+      )
+
+# Max correlation is with "open_water_day"
+plot( est_standard_length ~ open_water_day,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_est_standard_length ~ open_water_day | region, data = dfish )
+
+
+#--- Carbon and size
+
+plot( carbon_mg ~ est_standard_length,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+cor.test( dfish$log_carbon_mg, dfish$log_est_standard_length )
+
+
+
+#--- FS and size
+
+plot( feeding_success ~ est_standard_length,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+abline( v   = 25,
+        lty = 4,
+        col = "red" )
+
+cor.test( dfish$log_feeding_success, dfish$log_est_standard_length )
+
+
+plot( feeding_success ~ carbon_mg, 
+      data = dfish,
+      log = 'xy',
+      pch = 19,
+      col = dfish$region ) 
+
+cor.test( dfish$log_feeding_success, dfish$log_carbon_mg )
+
+
+```
+
+&nbsp;
+
+The amount of **ingested carbon is strongly correlated to size** in sampled fish (R = `r cor(dfish$log_carbon_mg,dfish$log_est_standard_length)`).  
+
+Correlation between fish size and their feeding success is significant (R = `r cor(dfish$log_feeding_success,dfish$log_est_standard_length)`), but much lower than with the amount of ingested carbon (R = `cor(dfish$log_carbon_mg,dfish$log_feeding_success)`).  
+
+&nbsp;
+
+## Succès alimentaire et environnement  
+
+&nbsp;
+
+### Explorations des données  
+
+&nbsp;
+
+On utilisera la variable log-transformée `log_indstandard` qui représente la densité de larves filtrées par les filets corrigé en fonction de la profondeur échantillonnée.  
+
+We will use the log-transformed variable which represents the filtrated density of fish from nets corrected for station depth.
+
+The variable `NASC_zoo` which represents the hydroacoustic signal of mesozooplankton abundance is problematic: very strong values weaken linear relationships between variables. We will use log-transformed values.
+
+&nbsp;
+
+```{r feeding success 1}
+
+#--- Ajoute les valeurs log-transformées
+
+dfish$log_indstandard <- log10( dfish$indstandard )
+dfish$log_NASC_zoo    <- log10( dfish$NASC_zoo )
+
+#--- Succès alimentaire et environnement
+
+dfish %>% select( log_feeding_success,
+                  log_indstandard,
+                  sampling_day,
+                  open_water_day,
+                  surf_sal_kgm3,
+                  surf_temp_degC,
+                  log_NASC_zoo,
+                  log_est_standard_length) %>% plot
+
+# Corrélations avec les variables explicatives potentielles
+rcorr( as.matrix( dfish[, c( "log_feeding_success",
+                             "log_indstandard",
+                             "sampling_day",
+                             "open_water_day",
+                             "surf_sal_kgm3",
+                             "surf_temp_degC",
+                             "log_NASC_zoo" ) ]
+                 ) 
+      )
+
+# Les corrélations significatives sont avec :
+# -> open_water_day
+# -> surf_sal_kgm3
+# -> log_NASC_zoo
+
+plot( feeding_success ~ est_standard_length,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_est_standard_length | region, data = dfish )
+
+plot( feeding_success ~ open_water_day,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ open_water_day | region, data = dfish )
+
+plot( feeding_success ~ surf_sal_kgm3,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ surf_sal_kgm3 | region, data = dfish )
+
+plot( feeding_success ~ NASC_zoo,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_NASC_zoo | region, data = dfish )
+```
+
+
+Mackenzie Shelf 2010 (MS 2010) values for feeding success, temperatures and zooplankton abundance are problematic . We will proceed to the analysis without this region-year combination.
+
+&nbsp;
+
+##Feeding success mixed linear models
+
+### Linear models
+
+&nbsp;
+
+We will establish multiple linear regression to try and explain feeding sucess variability of dissected fish. 
+We will then use mixed models to buffer for the strong spatial heterogeneity of our sample.
+
+&nbsp;
+
+```{r feeding simple model2}
+#--- Simple stepwise multiple regression model selection
+dfish_noMS2010 <- dfish %>% filter(dfish$region_year != "MS 2010") %>% droplevels(.$region_year)
+# model with intercept only
+
+feed.int <- lm(log_feeding_success ~ 1, data = dfish_noMS2010)
+
+  
+# model with all other explanatory variables
+feed.best2 <- lm(log_feeding_success ~ log_est_standard_length +
+                                       log_indstandard         +
+                                       open_water_day          +
+                                       surf_sal_kgm3           +
+                                       surf_temp_degC          +
+                                       log_NASC_zoo, 
+                data = dfish_noMS2010 )
+
+feed.best <- MASS::stepAIC( feed.int,
+                   direction = 'both',
+                   scope = formula(feed.best2)) 
+# => best model only includes log_est_standard_length & log_NASC_zoo
+
+summary(feed.best)
+summary(feed.best2)
+
+# Colinearity check
+car::vif(feed.best2)
+
+# Checking asumptions
+plot(feed.best2)
+confint(feed.best2)
+
+```
+
+&nbsp;
+
+Only **macrozooplancton** abundance from hydroacoustic signals and fish **size** explain 20% of variation ($R^2$ = `r summary(feed.best2)$adj.r.squared`)
+
+>We will now proceed with mixed models. 
+
+&nbsp;
+
+### Mixed models
+
+```{r feeding mixed model2}
+dfish_noMS2010 <- dfish %>% filter(dfish$region_year != "MS 2010") %>% droplevels(.$region_year)
+#--- linear mixed models
+
+# Regional relationships
+lattice::xyplot( log_feeding_success ~ log_est_standard_length | region, data = dfish_noMS2010 )
+lattice::xyplot( log_feeding_success ~ log_NASC_zoo            | region, data = dfish_noMS2010 )
+
+# Remove Amundsen Gulf Mouth region since no variance detected within region for many variables
+dfish.LMER2 <- dfish_noMS2010 %>% subset(., region!="Amundsen Gulf Mouth")
+
+# Modèle complet
+fish.LMER.all2 <- lmerTest::lmer( log_feeding_success ~log_est_standard_length +
+                                                       log_indstandard         +
+                                                       open_water_day          +
+                                                       surf_sal_kgm3           +
+                                                       surf_temp_degC          +
+                                                       log_NASC_zoo            +
+                                                       (1 | region/year),
+                                 data = dfish.LMER2 )
+summary(fish.LMER.all2)
+
+performance::icc(fish.LMER.all2)
+
+plot_model( fish.LMER.all2, 
+            type = "diag" )
+# => assumptions still hold
+
+performance::r2_nakagawa(fish.LMER.best2, by_group = FALSE)
+
+# Plot fixed effects
+plot_model( fish.LMER.all2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_est_standard_length"), 
+            show.data = TRUE )
+
+
+plot_model( fish.LMER.all2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_NASC_zoo"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( fish.LMER.all2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_est_standard_length","region"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.all2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_NASC_zoo","region"), 
+            show.data = TRUE )
+
+
+fish.LMER.best2 <- lmerTest::lmer( log_feeding_success ~log_est_standard_length +
+                                                        log_NASC_zoo            +
+                                                       (1 | region/year),
+                                 data = dfish.LMER2 )
+fish.LMER.int <- lmer(log_feeding_success ~  (1|region/year), data = dfish.LMER2)
+fish.LMER.int2 <- lmer(log_feeding_success ~  log_est_standard_length +
+                         (1|region/year), data = dfish.LMER2)
+fish.LMER.int3 <- lmer(log_feeding_success ~  log_est_standard_length          +
+                                                       surf_temp_degC          +
+                                                       log_NASC_zoo            + 
+                         (1|region/year), data = dfish.LMER2)
+fish.LMER.int4 <- lmer(log_feeding_success ~   log_est_standard_length         +
+                                                       surf_sal_kgm3           +
+                                                       log_NASC_zoo            + 
+                         (1|region/year), data = dfish.LMER2)
+fish.LMER.int5 <-  lmer(log_feeding_success ~   log_est_standard_length        +
+                                                       log_indstandard         +
+                                                       log_NASC_zoo            + 
+                         (1|region/year), data = dfish.LMER2)
+
+fish.LMER.int6 <-  lmer(log_feeding_success ~   log_est_standard_length        +
+                                                       open_water_day          +
+                                                       log_NASC_zoo            + 
+                         (1|region/year), data = dfish.LMER2)
+summary(fish.LMER.best2)
+performance::icc(fish.LMER.best2)
+
+plot_model( fish.LMER.best2, 
+            type = "diag" )
+# => Assumptions still hold
+AIC(fish.LMER.int, fish.LMER.int2, fish.LMER.best2, fish.LMER.int3, fish.LMER.int4, fish.LMER.int5, fish.LMER.int6, fish.LMER.all2)
+
+performance::r2_nakagawa(fish.LMER.best2, by_group = TRUE)
+performance::r2_nakagawa(fish.LMER.best2, by_group = FALSE)
+
+confint(fish.LMER.best2
+        )
+```
+
+&nbsp;
+
+# Question 2. FS ~ prey taxonomy
+
+We verify the relationship of *feeding success* with the diet **composition**.  
+
+## Multiple linear regressions
+```{r prey composition}
+prey_matrix_comb2$log_feeding_success        <- log10( prey_matrix_comb2$feeding_success             )
+prey_matrix_comb2$log_est_standard_length    <- log10( prey_matrix_comb2$est_standard_length         )
+prey_matrix_comb2$log_appendicularia         <- log10( prey_matrix_comb2$appendicularia           +1 )
+prey_matrix_comb2$log_calanus.glacialis.c    <- log10( prey_matrix_comb2$`calanus glacialis c`    +1 )
+prey_matrix_comb2$log_calanus.sp.n           <- log10( prey_matrix_comb2$`calanus sp n`           +1 )
+prey_matrix_comb2$log_cyclopoidae.sp.c       <- log10( prey_matrix_comb2$`cyclopoidae sp c`       +1 )
+prey_matrix_comb2$log_egg                    <- log10( prey_matrix_comb2$egg                      +1 )
+prey_matrix_comb2$log_other                  <- log10( prey_matrix_comb2$other                    +1 )
+prey_matrix_comb2$log_other.calanoid.sp.c    <- log10( prey_matrix_comb2$`other calanoid sp c`    +1 )
+prey_matrix_comb2$log_other.calanus.sp.c     <- log10( prey_matrix_comb2$`other calanus sp c`     +1 )
+prey_matrix_comb2$log_other.copepodite.and.n <- log10( prey_matrix_comb2$`other copepodite and n` +1 )
+prey_matrix_comb2$log_pseudocalanus.sp.c     <- log10( prey_matrix_comb2$`pseudocalanus sp c`     +1 )
+prey_matrix_comb2$log_pseudocalanus.sp.n     <- log10( prey_matrix_comb2$`pseudocalanus sp n`     +1 )
+
+prey_matrix_noMS2010 <- prey_matrix_comb2 %>% filter(region_year != "MS 2010")
+
+rcorr( as.matrix( prey_matrix_noMS2010[, c( "log_feeding_success",
+                             "log_appendicularia",
+                             "log_calanus.glacialis.c",
+                             "log_calanus.sp.n",
+                             "log_other",
+                             "log_egg",
+                             "log_other.calanoid.sp.c",
+                             "log_other.calanus.sp.c",
+                             "log_other.copepodite.and.n",
+                             "log_pseudocalanus.sp.c",
+                             "log_pseudocalanus.sp.n",
+                             "log_est_standard_length") ]
+                 ) 
+      )
+# Model with intercept only
+prey.int <- lm( log_feeding_success ~ 1, data = prey_matrix_noMS2010 )
+
+# Model with all explanatory variables
+prey.all <- lm( log_feeding_success ~ log_est_standard_length*(log_other.calanus.sp.c + log_calanus.glacialis.c) +
+                                      log_appendicularia         + 
+                                      log_calanus.glacialis.c    +
+                                      log_cyclopoidae.sp.c       + 
+                                      log_egg                    + 
+                                      log_other                  + 
+                                      log_other.calanoid.sp.c    + 
+                                      log_other.calanus.sp.c     + 
+                                      log_other.copepodite.and.n + 
+                                      log_pseudocalanus.sp.c     + 
+                                      log_pseudocalanus.sp.n*log_calanus.sp.n, 
+                data = prey_matrix_noMS2010 )
+
+summary(prey.all)
+# forward & backward stepwise regression
+prey.best <- step( prey.int,
+                   direction = 'both',
+                   scope = formula(prey.all) )
+
+
+# Verify results
+summary(prey.best)
+confint(prey.best)
+
+# => Best model keeps `calanus glacialis c`, `calanus sp n`, `other calanus sp c`, 
+#    `cyclopoidae sp c`, egg, `pseudocalanus sp c`, `other copepodite and n`, `other calanoid sp c` & log_est_standard_length
+
+# Colinearity check
+car::vif(prey.best)
+
+# Verify asumptions
+plot(prey.best)
+```
+
+&nbsp;
+
+Diet compposition **explains relatively well** feeding success variability ($R^2$ = `r summary(prey.best)$adj.r.squared`).  
+
+&nbsp;
+
+# MS 2010 case
+
+```{r MS 2010, eval = FALSE}
+plot(feeding_success ~ surf_temp_degC, col = region, data = dfish,
+     log = "xy", pch = 19, colors)
+
+station.CTD <- read.csv("/Users/pascalecaissy/Dropbox/MSc 2019-2020/station_list_PascaleCaissy_2021_01_16.csv", na.string = "")
+
+test.CTD <- NULL
+
+for(i in c(7:17)){
+  vec.CTD <- c(strsplit(paste(station.CTD$CTD_data_file[i]), split =", "))[[1]]
+  for (j in 1:length(vec.CTD)){
+  file.dir.CTD <- paste("/Users/pascalecaissy/Dropbox/MSc 2019-2020/Data - CTD/int_I_need", strftime(station.CTD$sampling_date, format = "%Y")[i], vec.CTD[j], sep = "/")
+      CTD <- read.table(file.dir.CTD, na.string = "NaN", skip = station.CTD$lines_to_skip[i], header = TRUE,stringsAsFactors = FALSE)
+      CTD[1,] <- NA
+      CTD <- apply(CTD, MARGIN = 2, as.numeric) %>% as.data.frame()
+      
+  plot(Pres ~ Dens, data = CTD, ylim = rev(c(0,100)), main = paste("Pycnocline of station", station.CTD$station[i]), type = "l")
+  plot(Pres ~ O2, data = CTD, ylim = rev(c(0,100)), main = paste("O2 vertical profile of station", station.CTD$station[i]), type = "l")
+  }
+}
+
+
+prof_melange <- function(x){
+  x <- x[!(is.na(x$Temp)),]
+  for(l in 2:nrow(x)){
+    r <- range(x$Temp[1:l], na.rm = TRUE)
+      if(abs(diff(as.numeric(r))) > 0.5) {
+         return(as.numeric(x$Pres[l]))
+      }
+    l = l+1
+  }
+  return(l-1)
+}
+
+density_stations = NULL
+for(i in 1:length(station.CTD$CTD_data_file)){
+  print(paste("i =", i))
+  vec.CTD <- c(strsplit(paste(station.CTD$CTD_data_file[i]), split =", "))[[1]]
+  if(vec.CTD[1] == "NA"){
+    test.CTD <- rbind(test.CTD, data.frame(station = station.CTD$station[i], sampling_date = station.CTD$sampling_date[i], max_fluo = NA, surf_sal_kgm3= NA, surf_temp_degC = NA, prof_mel = NA, cast_number = NA))
+  } else{
+    for (j in 1:length(vec.CTD)){
+      file.dir.CTD <- paste("/Users/pascalecaissy/Dropbox/MSc 2019-2020/Data - CTD/int_I_need", strftime(station.CTD$sampling_date, format = "%Y")[i], vec.CTD[j], sep = "/")
+      CTD <- read.table(file.dir.CTD, na.string = "NaN", skip = station.CTD$lines_to_skip[i], header = TRUE,stringsAsFactors = FALSE)
+      CTD[1,] <- NA
+      CTD <- apply(CTD, MARGIN = 2, as.numeric) %>% as.data.frame()
+      #trouver la zone de mélange
+      z <- prof_melange(CTD)
+      dens_initial <- CTD$Dens[CTD$Pres == min(CTD$Pres, na.rm = TRUE)+5 & !is.na(CTD$Pres)]
+      dens_final <- CTD$Dens[CTD$Pres == z +10 & !is.na(CTD$Pres)]
+      diff_dens <- dens_final - dens_initial
+      if(is_empty(diff_dens)){
+        density_stations <- rbind(density_stations, data.frame(station = station.CTD$station[i], sampling_date = station.CTD$sampling_date[i], region =station.CTD$region[i],  diff_dens = NA))
+      }
+      else{
+      density_stations <- rbind(density_stations, data.frame(station = station.CTD$station[i], sampling_date = station.CTD$sampling_date[i], region =station.CTD$region[i],  diff_dens = diff_dens))
+      }
+      j = j+1
+    }
+  }
+}
+
+density_stations$MS2010vsOther <- ifelse(density_stations$region == "Mackenzie Shelf" &  format(as.Date(density_stations$sampling_date, format="%Y-%m-%d"),"%Y")==2010, "MS 2010", "Other")
+
+dens_plot <- ggplot()+
+  geom_boxplot(data = density_stations, aes(y=diff_dens, 
+                                            x=as.factor(MS2010vsOther)))+
+  gg_themePC+
+  labs(x = "", y = "Density difference")
+dens_plot
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+tapply(X = density_stations$diff_dens, INDEX = density_stations$MS2010vsOther, FUN = median, na.rm =TRUE)
+tapply(X = density_stations$diff_dens, INDEX = density_stations$MS2010vsOther, FUN = mean, na.rm =TRUE)
+tapply(X = density_stations$diff_dens, INDEX = density_stations$MS2010vsOther, FUN = range, na.rm =TRUE)
+tapply(X = density_stations$diff_dens, INDEX = density_stations$MS2010vsOther, FUN = getmode)
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/dens_plot.jpg", plot = dens_plot, dpi = 500, width = 10, height = 10, bg = "transparent")
+
+T_FS <- ggplot( data = dfish, aes(y = feeding_success, x = surf_temp_degC, col = region)) +
+  labs(x = "Surface temperature (°C)", y = bquote('Feeding success (mg C mg'~W^-1~')'))+
+  geom_point(size = 4)+
+  gg_themePC+
+  scale_y_log10()+
+  scale_color_manual(values = colreg, name = "Region", labels = c("MS", "AGM", "CM", "LV", "PS", "LS", "NW", "WBB", "NEG"))
+
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/T_FS.jpg", plot = T_FS, dpi = 500, width = 14, height = 10, bg = "transparent")
+
+
+gutcontent2$MSvsOther <-ifelse(gutcontent2$region_year != "MS 2010", "other", "MS 2010")
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/preycomp_reg.jpg", plot = preycomp_reg, dpi = 500, width = 20, height = 8, bg = "transparent")
+ freqtable2 <- as.data.frame(table(gutcontent2[gutcontent2$region_year == "MS 2010", prey_id_comb], gutcontent2[gutcontent2$region_year == "MS 2010", station])) %>% filter(Freq!=0)
+freqtable2$Var1 <- ordered(freqtable2$Var1, levels = c("appendicularia", "egg", "other", "other copepodite and n", "cyclopoidae sp c", "other calanoid sp c", "pseudocalanus sp c", "pseudocalanus sp n", "calanus glacialis c", "other calanus sp c", "calanus sp n"))
+# 
+# 
+ ggplot() +
+   geom_bar(data =freqtable2, mapping = aes(fill=Var1, y=Freq, x=Var2), position="fill", stat="identity") +
+   scale_fill_manual(values =colours_bar[2:11])
+  ggplot() +
+   geom_bar(data =freqtable2, mapping = aes(fill=Var1, y=Freq, x=Var2), stat="identity") +
+   scale_fill_manual(values =colours_bar[2:11])
+
+# 
+carbon_input2 <- aggregate(carbon_mg ~ prey_id_comb + station + unique_fish_id, data = gutcontent2[region_year == "MS 2010",], FUN = sum)
+carbon_input3 <- aggregate(carbon_mg ~ prey_id_comb + station, data = carbon_input2, FUN=mean)
+ carbon_input3$prey_id_comb <- ordered(carbon_input3$prey_id_comb, levels = c("appendicularia", "egg", "other", "other copepodite and n", "cyclopoidae sp c", "other calanoid sp c", "pseudocalanus sp c", "pseudocalanus sp n", "calanus glacialis c", "other calanus sp c", "calanus sp n"))
+
+carbon23 <- ggplot() +
+  geom_bar(data =carbon_input3, mapping = aes(y=carbon_mg, x=station, fill = prey_id_comb), stat="identity") + scale_fill_manual(name = "", values =colours_bar, labels = c("Appendicularia", 
+                                                    "Egg", 
+                                                    "Other prey types",
+                                                    "Other copepodites / nauplii", 
+                                                    "Cyclopoida",
+                                                    "Calanoida",
+                                                    expression(paste(italic("Pseudocalanus "), "spp.", sep = "")),
+                                                    expression(paste(italic("Pseudocalanus "), "spp.  Nauplii", sep = "")),
+                                                    expression(italic("Calanus glacialis")),
+                                                    expression(paste(italic("Calanus "), "spp.", sep = "")), 
+                                                    expression(paste(italic("Calanus "), "spp.  Nauplii", sep = ""))
+                                                    ))+ 
+  theme_classic() +
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        axis.text.x = element_text(size=25),
+        axis.text.y = element_text(size = 25), 
+        legend.text = element_text(size = 28),
+        legend.text.align = 0,
+        axis.title = element_text(size = 25),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        plot.title = element_text(size = 30, hjust = 0.5))+
+   labs(x = "", y = "Mean ingested carbon (mg)")
+
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/carbonMSvsOther.jpg", plot = carbon23, dpi = 500, width = 20, height = 13, bg = "transparent")
+```
+
+
+# Figures
+
+### PCA with and without MS 2010
+
+&nbsp;
+
+```{r PCA env bio total, echo = FALSE}
+envbio_pca <- station_data%>% select(surf_temp_degC, surf_sal_kgm3, open_water_day, NASC_zoo,indstandard, region) %>% PCA(quali.sup = c(6), graph = FALSE)
+colours <- c(pals::stepped(n=24)[13:16], "#F57EB7", pals::stepped(n=24)[5:11], pals::stepped2(n=20)[13], pals::stepped(n=24)[c(1:4,17:20)],pals::stepped3(n=16)[16],pals::stepped(n=24)[21:23], pals::stepped3(n=20)[c(5:6)], "#FFC300")
+colreg <- colours[c(1,5,6,10,15,18,23,26,28)] 
+names(colreg) <- c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG")
+
+station_data$pc1_bio <- envbio_pca$ind$coord[, 1]
+station_data$pc2_bio <- envbio_pca$ind$coord[, 2]
+
+pca.vars <- envbio_pca$var$coord %>% data.frame
+pca.vars$vars <- c("Mixed layer\ntemperature", "Mixed layer\nsalinity", "Open water\ndays", "Macrozooplankton\nabundance", "Age-0 Arctic cod\ndensity")
+
+posArrowsX <- c(2.5, 3.5, 3, 3, 5)
+posArrowsY<- c(4.5, 3.75, 3.75, 7, 4)
+gg_PCA_bio <- ggplot() +  
+  geom_point(data = station_data, aes(x = pc1_bio, y = pc2_bio, colour = region), size = 4)+
+  #scale_colour_manual(values = colours)+
+  coord_equal()+
+  theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        legend.position = "right",
+        legend.text=element_text(size=25),
+        legend.title = element_blank(),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 18))+
+  scale_x_continuous(breaks = c(-3,-2,-1,-0,1,2,3), limits = c(-4, 4))+
+  scale_y_continuous(breaks = c(-4,-2,0,2,4), limits = c(-4.5,4.5))+
+  ggforce::geom_ellipse(aes(x0 = 2.8, y0 = -0.1, a = 0.8, b = 0.5, angle = -pi / 4), linetype = "dotted", col = "grey") +
+  labs(x= paste("PC1 (", round(envbio_pca$eig["comp 1", "percentage of variance"], digits = 2), "%)"),
+       y= paste("PC2 (", round(envbio_pca$eig["comp 2", "percentage of variance"], digits = 2), "%)"), size= 15) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  geom_segment(data = pca.vars, aes(x = 0, xend = Dim.1*3, y = 0, yend = Dim.2*3),
+               arrow = arrow(length = unit(0.025, "npc"), type = "open"), 
+               lwd = 0.5) + 
+  geom_text(data = pca.vars, 
+            aes(x = Dim.1*posArrowsX, y =  Dim.2*posArrowsY, label = vars), 
+            check_overlap = FALSE, size = 7)+
+  scale_color_manual(values = colreg, name = "Region", labels = c("MS", "AGM", "CM", "LV", "PS", "LS", "NW", "WBB", "GS"))
+gg_PCA_bio
+
+station_data2 <- dfish %>% filter(region_year!= "MS 2010") %>% 
+                            aggregate( data = ., 
+                            unique_fish_id ~ region         + 
+                                             station        +
+                                             surf_temp_degC +
+                                             surf_sal_kgm3  +
+                                             open_water_day +
+                                             NASC_zoo       +
+                                             indstandard,
+                            length )
+envbio_pca2 <- station_data2%>%filter()%>% select(surf_temp_degC, surf_sal_kgm3, open_water_day, NASC_zoo,indstandard, region) %>% PCA(quali.sup = c(6), graph = FALSE)
+colours <- c(pals::stepped(n=24)[13:16], "#F57EB7", pals::stepped(n=24)[5:11], pals::stepped2(n=20)[13], pals::stepped(n=24)[c(1:4,17:20)],pals::stepped3(n=16)[16],pals::stepped(n=24)[21:23], pals::stepped3(n=20)[c(5:6)], "#FFC300")
+colreg <- colours[c(1,5,6,10,15,18,23,26,28)] 
+names(colreg) <- c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG")
+
+station_data2$pc1_bio2 <- envbio_pca2$ind$coord[, 1]
+station_data2$pc2_bio2 <- envbio_pca2$ind$coord[, 2]
+
+pca.vars2 <- envbio_pca2$var$coord %>% data.frame
+pca.vars2$vars <- c("Mixed layer\ntemperature", "Mixed layer\nsalinity", "Open water\ndays", "Macrozooplankton\nabundance", "Age-0 Arctic cod\ndensity")
+
+posArrowsX2 <- c(2.5, 3.5, 4, 2.5, 4)
+posArrowsY2<- c(4,3,3.75,5,3.75)
+gg_PCA_bio2 <- ggplot() +  
+  geom_point(data = station_data2, aes(x = pc1_bio2, y = pc2_bio2, colour = region), size = 4)+
+  #scale_colour_manual(values = colours)+
+  coord_equal()+
+  theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        legend.position = "right",
+        legend.text=element_text(size=25),
+        legend.title = element_blank(),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 18))+
+  labs(x= paste("PC1 (", round(envbio_pca2$eig["comp 1", "percentage of variance"], digits = 2), "%)"),
+       y= paste("PC2 (", round(envbio_pca2$eig["comp 2", "percentage of variance"], digits = 2), "%)"), size= 15) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  scale_x_continuous(breaks = c(-3,-2,-1,-0,1,2,3), limits = c(-4, 4))+
+  scale_y_continuous(breaks = c(-4,-2,0,2,4), limits = c(-4.5,4.5))+
+  geom_segment(data = pca.vars2, aes(x = 0, xend = Dim.1*3, y = 0, yend = Dim.2*3),
+               arrow = arrow(length = unit(0.025, "npc"), type = "open"), 
+               lwd = 0.5) + 
+  geom_text(data = pca.vars2, 
+            aes(x = Dim.1*posArrowsX2, y =  Dim.2*posArrowsY2, label = vars), 
+            check_overlap = FALSE, size = 7)+
+  scale_color_manual(values = colreg, name = "Region", labels = c("MS", "AGM", "CM", "LV", "PS", "LS", "NW", "WBB", "GS"))
+gg_PCA_bio2
+
+legend_PCA <- get_legend(
+ # create some space to the left of the legend
+  gg_PCA_bio + theme(legend.box.margin = margin(0, 0, 0, 12))
+  )
+
+PCA_WithWithoutMS <- cowplot::plot_grid(gg_PCA_bio + theme(legend.position = "none"),
+                   gg_PCA_bio2 + theme(legend.position = "none"),
+                   legend_PCA,
+                   ncol = 3,
+                   labels = c("A", "B", ""),
+                   label_size = 30, 
+                   rel_widths = c(1,1,0.5),
+                   rel_heights = c(1,1,1))
+PCA_WithWithoutMS
+
+ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/PCA.jpg", plot = PCA_WithWithoutMS, dpi = 500, width = 18, height = 8, bg = "transparent")
+```
+
+### Carbon and size
+
+```{r carbon size FS fish cond, echo = FALSE}
+
+rq.10 <- quantreg::rq(log_carbon_mg~log_est_standard_length, data = dfish, tau = 0.1)
+summary(rq.10)
+rq.90 <- quantreg::rq(log_carbon_mg~log_est_standard_length, data = dfish, tau = 0.9)
+summary(rq.90)
+
+gg_themePC <- theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        legend.position = "bottom",
+        legend.text=element_text(size=25),
+        legend.title = element_blank(),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 18))
+
+
+
+dfish$color_MS2010 <- ifelse(dfish$region_year != "MS 2010", "other", "MS 2010")
+
+carb_size <- ggplot(data = dfish) +
+  geom_quantile(mapping = aes(x = est_standard_length, y = carbon_mg), quantiles = c(0.1, 0.9), formula = "y~x", col = c("darkgrey"), size = 2, alpha = 0.4) +
+  geom_point(mapping = aes(x = est_standard_length, y = carbon_mg, colour = color_MS2010), size = 2) + 
+  scale_x_log10(breaks = c(10,20,30,40,50)) + 
+  scale_y_log10() +
+  gg_themePC +
+  theme(legend.position = "none")+
+  scale_colour_manual(values = c("#0F8299", "darkgrey"), name = "")+
+  #scale_color_manual(values = colours, name = "Region") + 
+  annotate(geom = "text", x = 12, y = 1.2, label = paste("Spearman's ρ = ", round(cor(dfish$log_carbon_mg,dfish$log_est_standard_length, method = "spearman"), digits = 2)), size =7, col = "grey14")+
+  labs(y = "Ingested carbon (mg)", x = "Standard length (mm)")+
+  geom_vline(xintercept = 25, linetype = "dotted") #+
+  #geom_text(data = data.frame(words = c("Larvae (SL < 25 mm)","Juveniles (SL > 25 mm)"), posX = c(8.75, 35), posY = c(10,10)), 
+            #aes(x = posX, y = posY, label = words),
+            #size = 7)
+
+carb_size
+
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/carbsize.jpg", plot = carb_size, dpi = 500, width = 10, height = 8, bg = "transparent")
+
+```
+
+## Question 1: FS ~ size + environnement
+### FS ~ size + environnement (variables in final model)
+
+```{r modèles mixtes FS env figures, echo = FALSE}
+colreg <- colours[c(1,5,6,10,15,18,23,26,28)] 
+names(colreg) <- c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG")
+
+gg_themePC <- theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        legend.text=element_text(size=25),
+        legend.title= element_text(size=28),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 20))
+
+size_pred <- ggeffects::ggpredict(fish.LMER.best2 , terms = "log_est_standard_length")
+
+size_plot <- ggplot() +
+  geom_point(data = dfish.LMER2, mapping = aes(y = feeding_success, x = est_standard_length), size = 4, col = "darkgrey", alpha = 0.8) + 
+  geom_line(data = size_pred, mapping = aes(x = 10^x, y = 10^predicted))+
+  geom_ribbon(data = size_pred, mapping = aes(x = 10^x, ymin=10^conf.low, ymax=10^conf.high), alpha = 0.2)+
+  gg_themePC + 
+  scale_x_log10(breaks = c(10,20,30,40,50))+
+  scale_y_log10()+
+  # scale_color_manual(values = colreg, name = "Region") + 
+  labs(x = "Standard length (mm)", y = bquote('Feeding success (mg C mg'~W^-1~')'))
+size_plot
+
+zoo_pred <- ggeffects::ggpredict(fish.LMER.best2, terms = "log_NASC_zoo")
+
+zoo_plot <- ggplot() +
+  geom_jitter(data = dfish.LMER2, mapping = aes(y = feeding_success, x = NASC_zoo), col = "darkgrey", size = 4, alpha = 0.8) + 
+  geom_line(data = zoo_pred, mapping = aes(x = 10^x, y = 10^predicted))+
+  geom_ribbon(data = zoo_pred, mapping = aes(x = 10^x, ymin=10^conf.low, ymax=10^conf.high), alpha = 0.2)+
+  gg_themePC  + 
+  scale_x_log10()+
+  scale_y_log10()+
+  # scale_color_manual(values = colreg, name = "Region", labels = c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "North Eastern Greenland Sea")) + 
+  labs(x = bquote('Zooplankton backscatter (NASC;'~m^2~nmi^-2~')'), y = bquote('Feeding success (mg C mg'~W^-1~')'))
+
+zoo_plot
+
+prow <- plot_grid(
+  size_plot + theme(legend.position="none"),
+  zoo_plot + theme(legend.position="none"),
+  align = 'vh',
+  labels = c("A", "B"),
+  hjust = -1,
+  nrow = 1,
+  label_size = 30
+)
+prow
+
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/FSenv.jpg", plot = prow, dpi = 500, width = 18, height = 8, bg = "transparent")
+```
+
+## Question 2. FS ~ taxonomie
+### Barplots: Diet composition
+
+```{r larves vs juvéniles, echo = FALSE}
+freqtableLARV <- as.data.frame(table(gutcontent2$prey_id_comb[gutcontent2$est_standard_length<25],gutcontent2$region[gutcontent2$est_standard_length<25]))
+freqtableLARV$Var2 <- ordered(freqtableLARV$Var2, c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+
+freqtableLARV$Var1 <- ordered(freqtableLARV$Var1, levels = c("appendicularia", "egg", "other", "other copepodite and n", "cyclopoidae sp c", "other calanoid sp c", "pseudocalanus sp c", "pseudocalanus sp n", "calanus glacialis c", "other calanus sp c", "calanus sp n"))
+
+
+carbon_inputLARV <- aggregate(carbon_mg ~ prey_id_comb + region, data = gutcontent2[gutcontent2$est_standard_length<25,], FUN = sum)
+carbon_inputLARV$prey_id_comb <- ordered(carbon_inputLARV$prey_id_comb, levels = c("appendicularia", "egg", "other", "other copepodite and n", "cyclopoidae sp c", "other calanoid sp c", "pseudocalanus sp c", "pseudocalanus sp n", "calanus glacialis c", "other calanus sp c", "calanus sp n"))
+carbon_inputLARV$region <- ordered(carbon_inputLARV$region, c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+
+dfish$lengthCatego <- ifelse(dfish$est_standard_length<25, "L", "J")
+number_of_fish_per_bars <- dplyr::count(dfish, region, lengthCatego) %>% rbind(., data.frame(region = c("Larsen Sound - Victoria Strait", "West Baffin Bay"), lengthCatego = c("J", "J"), n = c(NA, NA)))
+number_of_fish_per_bars$region <- ordered(number_of_fish_per_bars$region, c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+
+colours_bar = pals::stepped(n = 24)[c(20:18,16:14,11,9,8,7,6)]
+gg_theme_bars <- ggplot() + scale_fill_manual(name = "", values =colours_bar, labels = c("Appendicularia", 
+                                                    "Egg", 
+                                                    "Other prey types",
+                                                    "Other copepodites / nauplii", 
+                                                    "Cyclopoida",
+                                                    "Calanoida",
+                                                    expression(paste(italic("Pseudocalanus "), "spp.", sep = "")),
+                                                    expression(paste(italic("Pseudocalanus "), "spp.  Nauplii", sep = "")),
+                                                    expression(italic("Calanus glacialis")),
+                                                    expression(paste(italic("Calanus "), "spp.", sep = "")), 
+                                                    expression(paste(italic("Calanus "), "spp.  Nauplii", sep = ""))
+                                                    ))+ 
+  theme_classic() +
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        axis.text.x = element_text(size=18),
+        axis.text.y = element_text(size = 20), 
+        legend.text = element_text(size = 18),
+        legend.text.align = 0,
+        axis.title = element_text(size = 25),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        plot.title = element_text(size = 30, hjust = 0.5))+
+  theme(plot.margin = unit(c(1,0,0,0), "cm"))+
+  scale_x_discrete(labels = c("MS", "AGM", "CM", "LV", "PS", "LS", "NW", "WBB", "GS"))+
+  coord_cartesian(clip = "off")
+
+preyocc_LARV<- gg_theme_bars +
+  geom_bar(data =freqtableLARV, mapping = aes(fill=Var1, y=Freq, x=Var2), position="fill", stat="identity")+
+  labs(x = "", y = "Quantitative proportion in diet") + 
+  geom_text(data = number_of_fish_per_bars[number_of_fish_per_bars$lengthCatego =="L",], aes(label=n, x = region, y = n), position=position_fill(), vjust=-0.5, size = 7)
+
+carbon_LARV <- gg_theme_bars+
+  geom_bar(data =carbon_inputLARV, mapping = aes(fill=prey_id_comb, y=carbon_mg, x=region), position="fill", stat="identity") +
+  labs(x = "", y = "Carbon proportion in diet")+ 
+  geom_text(data = number_of_fish_per_bars[number_of_fish_per_bars$lengthCatego =="L",], aes(label=n, x = region, y = n), position=position_fill(), vjust=-0.5, size = 7)
+
+legend_bars <- get_legend(
+ # create some space to the left of the legend
+  carbon_LARV + theme(legend.box.margin = margin(0, 0, 0, 12))
+  )
+
+
+
+
+freqtableJUV <- as.data.frame(table(gutcontent2$prey_id_comb[gutcontent2$est_standard_length>=25],gutcontent2$region[gutcontent2$est_standard_length>=25]))
+freqtableJUV$Var2 <- ordered(freqtableJUV$Var2, c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+
+freqtableJUV$Var1 <- ordered(freqtableJUV$Var1, levels = c("appendicularia", "egg", "other", "other copepodite and n", "cyclopoidae sp c", "other calanoid sp c", "pseudocalanus sp c", "pseudocalanus sp n", "calanus glacialis c", "other calanus sp c", "calanus sp n"))
+
+
+carbon_inputJUV <- aggregate(carbon_mg ~ prey_id_comb + region, data = gutcontent2[gutcontent2$est_standard_length>=25,], FUN = sum)
+carbon_inputJUV <- rbind(carbon_inputJUV, data.frame(prey_id_comb = c("appendicularia", "appendicularia"), carbon_mg = c(0,0), region = c("West Baffin Bay", "Larsen Sound - Victoria Strait")))
+carbon_inputJUV$prey_id_comb <- ordered(carbon_inputJUV$prey_id_comb, levels = c("appendicularia", "egg", "other", "other copepodite and n", "cyclopoidae sp c", "other calanoid sp c", "pseudocalanus sp c", "pseudocalanus sp n", "calanus glacialis c", "other calanus sp c", "calanus sp n"))
+carbon_inputJUV$region <- ordered(carbon_inputJUV$region, c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+
+preyocc_JUV<- gg_theme_bars +
+  geom_bar(data =freqtableJUV, mapping = aes(fill=Var1, y=Freq, x=Var2), position="fill", stat="identity")+
+  labs(x = "", y = "Quantitative proportion in diet")+
+  geom_text(data = number_of_fish_per_bars[number_of_fish_per_bars$lengthCatego =="J",], aes(label=n, x = region, y = n), position=position_fill(), vjust=-0.5, size = 7)
+
+carbon_JUV <- gg_theme_bars+
+  geom_bar(data =carbon_inputJUV, mapping = aes(fill=prey_id_comb, y=carbon_mg, x=region), position="fill", stat="identity") +
+  labs(x = "", y = "Carbon proportion in diet")+
+  geom_text(data = number_of_fish_per_bars[number_of_fish_per_bars$lengthCatego =="J",], aes(label=n, x = region, y = n), position=position_fill(), vjust=-0.5, size = 7)
+
+
+
+legend_bars <- get_legend(
+ # create some space to the left of the legend
+  carbon_JUV + theme(legend.box.margin = margin(0, 0, 0, 0))
+  )
+
+preycomp_LARV <- cowplot::plot_grid(
+  preyocc_LARV + theme(legend.position = "none", plot.title = element_text(hjust = -0.5, vjust = 1.5)) + labs(title = "Larvae (SL < 25 mm)"),
+  carbon_LARV + theme(legend.position = "none") + ggtitle(" "),
+                   ncol = 2,
+                   labels = c("A", "C"),
+                   label_size = 28, 
+                   vjust = 0.5,
+                   rel_widths = c(1,1))
+
+
+preycomp_JUV <-cowplot::plot_grid(
+  preyocc_JUV + theme(legend.position = "none",plot.title = element_text(hjust = -0.7, vjust = 1.5)) + labs(title = "Juveniles (SL > 25 mm)"),
+  carbon_JUV + theme(legend.position = "none")+ ggtitle(" "),
+                   ncol = 2,
+                   labels = c("B", "D"),
+                   label_size = 28,
+                   vjust = 0.5,
+                   rel_widths = c(1,1))
+
+
+preycomp_LARVJUV <- cowplot::plot_grid(preycomp_LARV, preycomp_JUV,
+                   nrow = 2,
+                   labels = c("",""),
+                   label_size = 33, 
+                   scale = c(0.9, 0.9))
+  
+  
+preycomp_WITHleg <- cowplot::plot_grid(preycomp_LARVJUV, 
+                                       legend_bars, 
+                                       ncol = 2, 
+                                       rel_widths =c(1, 0.3))
+
+
+
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/preycomp_LARVJUV.jpg", plot = preycomp_WITHleg, dpi = 500, width = 20, height = 13, bg = "transparent")
+```
+
+### FS ~ diet composition
+```{r figures composition diète, echo = FALSE}
+var_inmodel <- list(log_name = c("log_egg",
+                                       "log_calanus.glacialis.c",
+                                       "log_calanus.sp.n",
+                                       "log_other.calanus.sp.c",
+                                       "log_pseudocalanus.sp.c",
+                                       "log_other.copepodite.and.n",
+                                       "log_cyclopoidae.sp.c"),
+                          name = c("Eggs", 
+                                   expression(italic("Calanus glacialis")),
+                                   expression(italic("Calanus")~"spp. nauplii"),
+                                   expression("Other"~italic("Calanus")~"spp."),
+                                   expression(italic("Pseudocalanus")~"spp."),
+                                   expression("Other"~"copepods"),
+                                   "Cyclopoida"
+                                   ))
+
+myplots <- list()
+for(i in 1:length(var_inmodel$log_name)){
+t <- as.character(var_inmodel$log_name[i])
+s <- as.character(var_inmodel$name[i])
+p <- ggplot() +
+  geom_jitter(data = prey_matrix_comb2, mapping = aes(y = feeding_success, x = (10^.data[[t]])-0.2), col = "darkgrey", size = 4, alpha = 0.8) + 
+  geom_line(data = ggeffects::ggpredict(prey.best, terms = t), mapping = aes(x = (10^x)-0.2, y = 10^predicted))+
+  geom_ribbon(data = ggeffects::ggpredict(prey.best, terms = t), mapping = aes(x = (10^x)-0.2, ymin=10^conf.low, ymax=10^conf.high), alpha = 0.2)+
+  gg_themePC + 
+  scale_x_log10(breaks = c(0, 1,10,100))+
+  scale_y_log10()+
+  theme(legend.position = "none")+
+  scale_color_manual(values = colreg, name = "Region") +
+  labs(x = parse(text = s), y = "")
+
+myplots[[i]] <- p
+}
+
+
+preycomp_plot <- cowplot::plot_grid(plotlist =myplots,
+                   labels = LETTERS[1:7],
+                   label_size = 30,
+                   nrow = 4,
+                   ncol = 2,
+                   scale = 0.8) 
+
+labx<- ggdraw() + draw_label("Prey count in diet", y =0, x=0.5, size = 30)
+laby <- ggdraw() + draw_label(bquote('Feeding success (mg C mg'~W^-1~')'), angle = 90, x=0, y = 5, size = 30)
+
+withlabx <- cowplot::plot_grid(preycomp_plot, labx, nrow = 2, 
+                   scale = c(1, 0.01),
+                   rel_heights = c(4,0.25))
+withlabxy <-cowplot::plot_grid(laby, withlabx, ncol = 2, 
+                   scale = c(0.01, 1),
+                   rel_widths = c(0.25,4))
+withlabxy
+#ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/FSpreycomp.jpg", plot = withlabxy, dpi = 500, width = 15, height = 25, bg = "transparent")
+```
+
+# Data required to write methodology (nombres)
+```{r données metho, echo=TRUE, eval = FALSE}
+CA_net_types <- readxl::read_excel("~/Dropbox/MSc 2019-2020/Data - Stomach content/bosa stomach content_2020_12_05.xlsx", 
+    sheet = "selected cods") %>% filter(!is.na(total_preys))
+str(CA_net_types)
+
+table(CA_net_types$gear)
+table(is.na(CA_net_types$standard_length), is.na(CA_net_types$height_anus))
+
+```
+
+# Supplementary code
+
+## Bu date vs open water day
+```{r bu date vs open water day}
+jul.conv <- function(x) { 
+  J <- julian( x, as.Date(paste0(format(x,"%Y"),"-01-01")))
+  return(J[1])
+}
+
+dfish$bu_date_jul <- sapply(as.Date(dfish$bu_date), FUN = jul.conv)
+
+plot(dfish$open_water_day ~ dfish$bu_date_jul)
+cor(dfish$open_water_day, dfish$bu_date_jul)
+summary(lm(dfish$open_water_day ~ dfish$bu_date_jul))
+
+```
+

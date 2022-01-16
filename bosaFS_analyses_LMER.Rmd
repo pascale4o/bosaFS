@@ -1,0 +1,1685 @@
+---
+title: "bosaFS analyses LMER"
+author: "Pascale Caissy"
+date: '2021-03-11'
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("tidyverse")
+library("data.table")
+library("FactoMineR")
+library("ggplot2")
+library("ggfortify")
+library("reshape2")
+library("lmerTest")
+library("sjPlot")
+library("vegan")
+library("Hmisc")
+```
+
+# Préparation des données  
+
+&nbsp;
+
+Méthode de catégorisation des proies :  
+
+* Utiliser d'abord la taxonomie pour regrouper ensemble;  
+
+* Vérifier à la fois l'apport en *nombre* et en *% carbone* pour chaque catégorie;  
+
+* Rassembler dans une *autre* catégorie quand représente < 1 % du carbone et < 5 % du nombre de proies.  
+
+```{r prey matrix}
+dfish <- read.csv("/Users/pascalecaissy/Dropbox/MSc 2019-2020/bosaFS/fish_data_PC_20210107.csv", check.names = FALSE ) %>% select(-1)
+
+gutcontent2              <- read.csv("/Users/pascalecaissy/Dropbox/MSc 2019-2020/bosaFS/gutcontent_bosa_carbon20210121.csv") %>% select(-X,-X.1)
+gutcontent2$prey_id_comb <- with( gutcontent2, 
+                                  ifelse( prey_reass %in% c("triconia borealis c", "oithona similis c", "onceaidae sp c", "oncea sp c", "cyclopoid sp c"), 
+                                          "cyclopoidae sp c", 
+                                          ifelse( prey_reass %in% c("appendicularian sp", "fritillaria sp", "oikopleura sp"), 
+                                                  "appendicularia", 
+                                                  ifelse( prey_reass %in% c("calanus sp n", "calanus glacialis n"), 
+                                                          "calanus sp n",
+                                                          ifelse(prey_reass %in% c("calanoid sp", "calanoid sp c", "heterorhabdus norvegicus c", "metridia longa c", "chiridus sp c", "acartia sp c", "eurytemora sp c", "pseudocalanus sp/acartia sp c", "paraheterorhabdus compactus c", "paraeuchaeta sp c", "scolecithricella sp c", "spinocalanus sp c", "microcalanus sp c"), 
+                                                                 "other calanoid sp c",
+                                                                 ifelse(prey_reass %in% c("calanoid sp n", "acartia sp n", "pseudocalanus sp/metridia longa n", "metridia longa n", "cyclopoid n", "microcalanus sp n", "microcalanus sp  n", "oithona similis n", "cyclopoid sp n", "unknown n"), 
+                                                                        "other copepodite and n", 
+                                                                        ifelse(prey_reass %in% c("egg","egg sack"), 
+                                                                               "egg",
+                                                                               ifelse(prey_reass %in% c("fecal pellet","radiolarian sp","vers", "unknown", "chaetognath sp", "vertebrae", "trematoda sp", "parasite","polychaetae larvae", "digested matter", "crustacea sp meta", "amphipod sp", "decapoda sp meta", "euphausiacea sp", "decapoda sp", "boroecia maxima", "cirripedia sp", "cirripedia sp n", "podon sp", "coscinodiscus sp"),
+                                                                                      "other",
+                                                                                      ifelse(prey_reass %in% c("unknown c", "harpacticoid sp c", "unknown nc"),
+                                                                                             "other copepodite and n",
+                                                                                             ifelse(prey_reass %in% c("calanus sp c", "calanus finmarchicus c", "calanus hyperboreus c"),
+                                                                                                    "other calanus sp c", 
+                                                                                                    ifelse(prey_reass %in% c("bivalve larvae","limacina helicina"), 
+                                                                                                           "other", as.character(prey_reass) ) ) ) ) ) ) ) ) ) ) )
+
+#--- Graphiques préliminaires
+
+barplot( sort( table( gutcontent2$prey_id_comb ), decreasing = TRUE ) / 
+          sum( table( gutcontent2$prey_id_comb ) ),
+         main = "Abundance"
+        ) 
+abline(h = 0.05, col = "lightblue")
+abline(h = 0.01, col="red")
+
+barplot( sort( tapply( gutcontent2$carbon_mg, 
+                       INDEX = list(gutcontent2$prey_id_comb), 
+                       FUN   = sum, 
+                       na.rm = TRUE ),
+               decreasing = TRUE ) / 
+         sum( gutcontent2$carbon_mg, na.rm = TRUE ),
+         main = "Carbon %"
+        )
+abline(h = 0.05, col = "lightblue")
+abline(h = 0.01, col="red")
+```
+
+&nbsp;
+
+Préparation des données par région d'échantillonnage.  
+
+```{r prep données}
+#--- Ajoute les dates d'échantillonnage en jours Juliens
+
+jul.conv <- function(x) { 
+  J <- julian( x, as.Date( paste0(format(x,"%Y"),"-01-01") ) )
+  return( J[1] )
+}
+
+dfish$sampling_day <- dfish$sampling_date      %>%
+                      as.Date( ., "%Y-%m-%d" ) %>%
+                      sapply( ., jul.conv )
+
+#--- Régions
+#    Beaufort Sea: Mackenzie Shelf, Amundsen Gulf Maud
+#    Kitikmeot   : Coronation Maud, Larsen Sound, Peel Sound
+#    Baffin Bay  : North Water, Lancaster Sound, NW Baffin Bay
+
+dfish$province <- with( dfish, ifelse( region %in% c("Mackenzie Shelf","Amundsen Gulf Mouth"), 
+                                       "Beaufort Sea",
+                                       ifelse( region %in% c("Coronation Maud","Larsen Sound - Victoria Strait","Peel Sound"), 
+                                               "Kitikmeot",
+                                               ifelse( region == "NEG", 
+                                                       "Greenland Sea",
+                                                       "NW Baffin Bay" ) ) ) )
+
+reg_initials <- data.frame( region   = levels(dfish$region), 
+                            initials = c( "AGM", "CM", "LS", "LV", "MS", "NEG", "NW", "PS", "WBB" ) )
+
+dfish             <- merge( dfish, reg_initials )
+dfish$region_year <- as.factor( paste( dfish$initials, dfish$year ) ) %>%
+                     ordered( ., levels = c( "MS 2009" ,"MS 2010" ,"MS 2014" ,"MS 2015",
+                                             "AGM 2015", 
+                                             "CM 2011" ,"CM 2016" ,"CM 2017" ,"CM 2018",
+                                             "LV 2010" , "LV 2016","LV 2018" ,
+                                             "PS 2010" ,"PS 2011" ,"PS 2014" ,"PS 2015","PS 2016",
+                                             "LS 2010" ,"LS 2011" ,"LS 2015" ,"LS 2016","LS 2017",
+                                             "NW 2014" ,"NW 2016" , "NW 2018",
+                                             "WBB 2015","WBB 2016",
+                                             "NEG 2017" )
+                            )
+
+###
+
+gutcontent2$sampling_day <- gutcontent2$sampling_date %>%
+                            as.Date( ., "%Y-%m-%d" )  %>%
+                            sapply( ., jul.conv )
+gutcontent2              <- merge( gutcontent2, reg_initials )
+gutcontent2$region_year  <- as.factor( paste( gutcontent2$initials, gutcontent2$year ) )
+
+prey_matrix_comb2 <- dcast( setDT(gutcontent2), unique_fish_id ~ prey_id_comb, length ) %>% 
+                     merge( ., dfish[ , c( "unique_fish_id",
+                                           "region_year",
+                                           "region",
+                                           "station",
+                                           "open_water_day",
+                                           "surf_sal_kgm3",
+                                           "surf_temp_degC",
+                                           "NASC_zoo",
+                                           "indstandard",
+                                           "prof_mel",
+                                           "est_standard_length",
+                                           "fish_cond",
+                                           "feeding_success" ) ] ) %>% 
+                     select( -unique_fish_id )
+
+station_data <- aggregate( data = dfish, 
+                           unique_fish_id ~ region_year    + 
+                                            station        +
+                                            surf_temp_degC +
+                                            surf_sal_kgm3  +
+                                            open_water_day +
+                                            NASC_zoo       +
+                                            indstandard    +
+                                            prof_mel,
+                           length )
+```
+
+&nbsp;
+
+# PCA 
+
+&nbsp;
+
+## PCA des régions-années, et relations entre l'environnement et l'abondance de zoo et de larves
+
+&nbsp;
+
+```{r PCA env bio total}
+envbio_pca <- station_data%>% select(surf_temp_degC, surf_sal_kgm3, open_water_day, NASC_zoo,indstandard, region_year, prof_mel) %>% PCA(quali.sup = c(6), graph = FALSE)
+colours <- c(pals::stepped(n=24)[13:16], pals::polychrome(n=4)[4], pals::stepped(n=24)[5:11], pals::stepped2(n=20)[13], pals::stepped(n=24)[c(1:4,17:20)],pals::stepped3(n=16)[16],pals::stepped(n=24)[21:23], pals::stepped3(n=20)[c(5:6)], "red")
+station_data$pc1_bio <- envbio_pca$ind$coord[, 1]
+station_data$pc2_bio <- envbio_pca$ind$coord[, 2]
+
+pca.vars <- envbio_pca$var$coord %>% data.frame
+pca.vars$vars <- c("Température", "Salinté", "Nombre de jours\ndepuis débâcle", "Zoo", "Larves", "Profondeur\nde mélange")
+
+posArrowsX <- c(2.5, 3.5, 3,3,4,4)
+posArrowsY<- c(5.5,3.5,3.75,4,3.75,4)
+gg_PCA_bio <- ggplot() +  
+  geom_point(data = station_data, aes(x = pc1_bio, y = pc2_bio, colour = region_year), size = 4)+
+  #scale_colour_manual(values = colours)+
+  coord_equal()+
+  theme_classic()+
+  theme(panel.background = element_rect(fill = "transparent"), # bg of the panel
+        plot.background = element_rect(fill = "transparent", color = NA),
+        legend.background = element_rect(fill=alpha('white', 0.4)),
+        legend.text=element_text(size=25),
+        legend.title= element_text(size=28),
+        axis.title = element_text(size = 25),
+        axis.text = element_text(size = 18))+
+  labs(x= paste("PC1 (", round(envbio_pca$eig["comp 1", "percentage of variance"], digits = 2), "%)"),
+       y= paste("PC2 (", round(envbio_pca$eig["comp 2", "percentage of variance"], digits = 2), "%)"), size= 15) +
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  geom_segment(data = pca.vars, aes(x = 0, xend = Dim.1*3, y = 0, yend = Dim.2*3),
+               arrow = arrow(length = unit(0.025, "npc"), type = "open"), 
+               lwd = 0.5) + 
+  geom_text(data = pca.vars, 
+            aes(x = Dim.1*posArrowsX, y =  Dim.2*posArrowsY, label = vars), 
+            check_overlap = FALSE, size = 7)+
+  scale_color_manual(values = colours, name = "Région année")
+gg_PCA_bio
+
+ggsave("/Users/pascalecaissy/Dropbox/MSc 2019-2020/Hiver 2021/Colloque/PCA.jpg", plot = gg_PCA_bio, dpi = 500, width = 14, height = 10, bg = "transparent")
+```
+
+#  Modèles de succès alimentaire  
+
+&nbsp;
+
+## Exploration préliminaire  
+
+&nbsp;
+
+Concernant les mesures de taille spécifiquement, on utilisera les variables log-transformées.  
+
+On fera de même avec la mesure de succès alimentaire (`feeding_success`).  
+
+&nbsp;
+
+```{r explo Question 2 poissons}
+
+#--- Ajoute les valeurs log-transformées
+
+dfish$log_carbon_mg           <- log10( dfish$carbon_mg )
+dfish$log_est_standard_length <- log10( dfish$est_standard_length )
+dfish$log_feeding_success     <- log10( dfish$feeding_success )
+
+
+#--- Taille des poissons
+
+# Distribution par région
+par( mar = c(6,4,0,0) )
+plot( log_est_standard_length ~ region, 
+      data = dfish,
+      xlab = "",
+      las  = 2 )
+
+# Couverture spatio-temporelle d'échantillonnage
+tapply( dfish$est_standard_length,
+        INDEX = list( dfish$region, dfish$year ), 
+        FUN   = mean )
+
+
+#--- Taille et environnement
+
+dfish %>% select( log_est_standard_length,
+                  sampling_day,
+                  open_water_day,
+                  prof_mel,
+                  surf_sal_kgm3,
+                  surf_temp_degC,
+                  NASC_zoo ) %>% plot
+
+# Corrélations avec les variables explicatives potentielles
+rcorr( as.matrix( dfish[, c( "log_est_standard_length",
+                             "sampling_day",
+                             "open_water_day",
+                             "prof_mel",
+                             "surf_sal_kgm3",
+                             "surf_temp_degC",
+                             "NASC_zoo" ) ]
+                 ) 
+      )
+
+# La corrélation maximale est avec "open_water_day"
+plot( est_standard_length ~ open_water_day,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_est_standard_length ~ open_water_day | region, data = dfish )
+
+
+#--- Taille et carbone
+
+plot( carbon_mg ~ est_standard_length,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+cor.test( dfish$log_carbon_mg, dfish$log_est_standard_length )
+
+
+#--- Taille et succès alimentaire
+
+plot( feeding_success ~ est_standard_length,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+abline( v   = 25,
+        lty = 4,
+        col = "red" )
+
+cor.test( dfish$log_feeding_success, dfish$log_est_standard_length )
+
+
+plot( feeding_success ~ carbon_mg, 
+      data = dfish,
+      log = 'xy',
+      pch = 19,
+      col = dfish$region ) 
+
+cor.test( dfish$log_feeding_success, dfish$log_carbon_mg )
+
+
+#--- Taille et condition des poissons
+
+plot( fish_cond ~ est_standard_length,
+      data = dfish,
+      log  = 'x',
+      pch  = 19,
+      col  = dfish$region ) 
+
+abline( v   = 25,
+        lty = 4,
+        col = "red" )
+
+cor.test( dfish$fish_cond, dfish$log_est_standard_length )
+
+
+plot( feeding_success ~ fish_cond,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+cor.test( dfish$fish_cond, dfish$log_feeding_success )
+#faible corrélation entre FS et condition physique
+```
+
+&nbsp;
+
+La quantité de **carbone ingérée est fortement corrélée à la taille** des poissons (R = `r cor(dfish$log_carbon_mg,dfish$log_est_standard_length)`) !  
+
+La corrélation entre la taille des poissons et leur succès alimentaire est significative mais bien plus faible (R = `r cor(dfish$log_feeding_success,dfish$log_est_standard_length)`) qu'entre la quantité de carbone ingérée et le succès alimentaire (R = `cor(dfish$log_carbon_mg,dfish$log_feeding_success)`).  
+
+Les plus grands poissons n'ont pas nécessairement une meilleure condition physique; la corrélation entre la condition et la taille n'est pas significative (R = `r cor(dfish$fish_cond,dfish$log_est_standard_length)`).  
+
+La corrélation entre le succès alimentaire (mesure **à court terme** de l'alimentation des poissons) et la condition (mesure **intégratrice** de l'alimentation des poissons) des individus est significative mais très bruitée (R = `r cor(dfish$fish_cond,dfish$log_feeding_success)`).  
+
+&nbsp;
+
+## Succès alimentaire et environnement  
+
+&nbsp;
+
+### Explorations des données  
+
+&nbsp;
+
+On utilisera la variable log-transformée `log_indstandard` qui représente la densité de larves filtrées par les filets corrigé en fonction de la profondeur échantillonnée.  
+
+La variable `NASC_zoo` qui représente la concentration de mesozooplankton observée par méthodes acoustiques est problématique : les très fortes valeurs nuisent à des relations linéaires entre variables. On utilisera les valeurs log-transformées.  
+
+&nbsp;
+
+
+```{r feeding success 1}
+
+#--- Ajoute les valeurs log-transformées
+
+dfish$log_indstandard <- log10( dfish$indstandard )
+dfish$log_NASC_zoo    <- log10( dfish$NASC_zoo )
+
+
+#--- Succès alimentaire et environnement
+
+dfish %>% select( log_feeding_success,
+                  log_indstandard,
+                  sampling_day,
+                  open_water_day,
+                  surf_sal_kgm3,
+                  surf_temp_degC,
+                  log_NASC_zoo ) %>% plot
+
+# Corrélations avec les variables explicatives potentielles
+rcorr( as.matrix( dfish[, c( "log_feeding_success",
+                             "log_indstandard",
+                             "sampling_day",
+                             "open_water_day",
+                             "surf_sal_kgm3",
+                             "surf_temp_degC",
+                             "log_NASC_zoo" ) ]
+                 ) 
+      )
+
+# Les corrélations significatives sont avec :
+# -> open_water_day
+# -> surf_sal_kgm3
+# -> log_NASC_zoo
+
+plot( feeding_success ~ est_standard_length,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_est_standard_length | region, data = dfish )
+
+plot( feeding_success ~ open_water_day,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ open_water_day | region, data = dfish )
+
+plot( feeding_success ~ surf_sal_kgm3,
+      data = dfish,
+      log  = 'y',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ surf_sal_kgm3 | region, data = dfish )
+
+plot( feeding_success ~ NASC_zoo,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_NASC_zoo | region, data = dfish )
+```
+
+&nbsp;
+
+### Modèles de régression linéaire  
+
+&nbsp;
+
+On va établir les modèles de régression linéaire multiples pour essayer d'expliquer la variabilité du succès alimentaire des poissons échantillonnés.  
+
+Lorsque pertinent, nous utiliserons des modèles à effet mixtes aléatoires pour tenir compte de la forte hétérogénéité spatiale de notre échantillonnage.  
+
+&nbsp;
+
+```{r feeding simple model}
+
+#--- Simple stepwise multiple regression model selection
+
+# modèle avec ordonnée à l'origine seulement
+feed.int <- lm( log_feeding_success ~ 1, data = dfish )
+
+# modèle avec toutes les variables explicatives
+feed.all <- lm( log_feeding_success ~ log_indstandard         +
+                                      open_water_day          +
+                                      surf_sal_kgm3           +
+                                      surf_temp_degC          +
+                                      log_NASC_zoo, 
+                data = dfish )
+
+# forward & backward stepwise selection
+feed.best <- step( feed.int,
+                   direction = 'both',
+                   scope = formula(feed.all) )
+
+# Vérifie les résultats de la procédure sur la séléction des variables
+show(feed.best$anova)
+
+# => meilleur modèle ne garde que open_water_day, log_indstandard, log_NASC_zoo & surf_sal_kgm3
+# => le R2 est faible = 0.10
+summary(feed.best)
+
+# Vérifie la colinéarité
+car::vif(feed.best)
+
+# Vérifie les conditions d'application
+plot(feed.best)
+```
+
+&nbsp;
+
+Les conditions environnementales expliquent mal la variabilité du succès d'alimentation.  
+
+Seulement la **salinité** de surface, l'abondance de **larves**, l'abondance de **macrozooplancton** révélée par l'acoustique et le **nombre de jours depuis la débâcle** des poissons explique < 10 % de la variance observée ($R^2$ = `r summary(feed.best)$adj.r.squared`)
+
+> On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale.  
+
+&nbsp;
+
+```{r feeding mixed model}
+#--- modèles mixtes linéraires
+
+# Vérifie les relations par région
+lattice::xyplot( log_feeding_success ~ log_indstandard         | region, data = dfish )
+lattice::xyplot( log_feeding_success ~ open_water_day          | region, data = dfish )
+lattice::xyplot( log_feeding_success ~ surf_sal_kgm3           | region, data = dfish )
+lattice::xyplot( log_feeding_success ~ log_NASC_zoo            | region, data = dfish )
+
+# Supprime les régions "Amundsen Gulf Mouth" & "NEG" car PAS DE VARIANCE pour plusieurs variables !
+dfish.LMER <- dfish %>% subset(., region!="Amundsen Gulf Mouth" & region!="NEG" )
+
+# Modèle complet
+fish.LMER.all <- lmerTest::lmer( log_feeding_success ~ log_indstandard         + 
+                                                       surf_sal_kgm3           +
+                                                       open_water_day          +
+                                                       log_NASC_zoo            +
+                                                      (log_indstandard         + 
+                                                       surf_sal_kgm3           + 
+                                                       open_water_day          +
+                                                       log_NASC_zoo           | region),
+                                 data = dfish.LMER )
+summary(fish.LMER.all)
+
+performance::icc(fish.LMER.all)
+# => le groupement par région explique 33.8% de la variance du succès d'alimentation
+
+lmerTest::ranova(fish.LMER.all)
+# => montre quelles variables explicatives enlever des effets aléatoires :
+#    Enlever surf_sal_kgm3 améliore le modèle (AIC < & p-value >> 0.05)                     -> on enlève
+#    Enlever open_water_day améliore le modèle (AIC < & p-value >> 0.05)                     -> on enlève
+#    Enlever log_indstandard a un impact significatif (AIC > & p<<0.05)                     -> on garde
+#    Enlever open_water_day rend le modèle un peu moins bien (AIC > & p-value ~ 0.05)       -> on garde
+
+# Meilleur modèle
+fish.LMER.best <- lmerTest::lmer( log_feeding_success ~ open_water_day + 
+                                                        surf_sal_kgm3           +
+                                                        log_NASC_zoo            +
+                                                        log_indstandard         +
+                                                       (log_NASC_zoo  + log_indstandard          | region),
+                                  data = dfish.LMER )
+summary(fish.LMER.best)
+
+performance::icc(fish.LMER.best)
+# => le groupement par région explique 36% de la variance du succès d'alimentation
+
+plot_model( fish.LMER.best, 
+            type = "diag" )
+# => les conditions d'application de la régression linéaire sont parfaitement respectées
+
+# Plot fixed effects
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("open_water_day"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("surf_sal_kgm3"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_NASC_zoo"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_indstandard"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("open_water_day","region"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("surf_sal_kgm3","region"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_NASC_zoo","region"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_indstandard","region"), 
+            show.data = TRUE )
+```
+
+&nbsp;
+
+Ajouter les régions comme effet aléatoire est plus rigoureux d'un point de vue de l'analyse de nos résultats, et cela permet de tenir compte de la variabilité de l'effet des variables explicatives sur le succès alimentaire selon les régions, en particulier de la densité de zooplancton observée par l'acoustique qui démontre des effets parfois inverses.  
+
+&nbsp;
+
+## Condition et environnement
+
+&nbsp;
+
+### Explorations des données  
+
+&nbsp;
+
+```{r condition exploration}
+#--- condition et environnement
+
+dfish %>% select( fish_cond,
+                  log_est_standard_length,
+                  log_indstandard,
+                  sampling_day,
+                  open_water_day,
+                  surf_sal_kgm3,
+                  surf_temp_degC,
+                  log_NASC_zoo ) %>% plot
+
+# Corrélations avec les variables explicatives potentielles
+rcorr( as.matrix( dfish[, c( "fish_cond",
+                             "log_est_standard_length",
+                             "log_indstandard",
+                             "sampling_day",
+                             "open_water_day",
+                             "surf_sal_kgm3",
+                             "surf_temp_degC",
+                             "log_NASC_zoo" ) ]
+                 ) 
+      )
+
+# Les corrélations significatives sont avec :
+# -> log_indstandard
+# -> open_water_day
+# -> surf_temp_degC
+
+plot( fish_cond ~ indstandard,
+      data = dfish,
+      log  = 'x',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( fish_cond ~ log_indstandard | region, data = dfish )
+
+plot( fish_cond ~ open_water_day,
+      data = dfish,
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( fish_cond ~ open_water_day | region, data = dfish )
+
+plot( fish_cond ~ surf_temp_degC,
+      data = dfish,
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( fish_cond ~ surf_temp_degC | region, data = dfish )
+```
+
+&nbsp;
+
+### Modèles de régression linéaire  
+
+&nbsp;
+
+On va établir les modèles de régression linéaire multiples pour essayer d'expliquer la variabilité de l'indice de condition des poissons échantillonnés.  
+
+Lorsque pertinent, nous utiliserons des modèles à effet mixtes aléatoires pour tenir compte de la forte hétérogénéité spatiale de notre échantillonnage.  
+
+&nbsp;
+
+```{r condition simple model}
+
+#--- Simple stepwise multiple regression model selection
+
+# modèle avec ordonnée à l'origine seulement
+cond.int <- lm( fish_cond ~ 1, data = dfish )
+
+# modèle avec toutes les variables explicatives
+cond.all <- lm( fish_cond ~ log_indstandard         +
+                            open_water_day          +
+                            surf_sal_kgm3           +
+                            surf_temp_degC          +
+                            log_NASC_zoo, 
+                data = dfish )
+
+# forward & backward stepwise selection
+cond.best <- step( cond.int,
+                   direction = 'both',
+                   scope = formula(cond.all) )
+
+# Vérifie les résultats de la procédure sur la séléction des variables
+show(cond.best$anova)
+
+# => meilleur modèle n'enlève que surf_sal_kgm3
+# => le R2 est faible = 0.099
+summary(cond.best)
+
+# Vérifie la colinéarité
+car::vif(cond.best)
+
+# Vérifie les conditions d'application
+plot(cond.best)
+```
+
+&nbsp;
+
+Les conditions environnementales expliquent mal la variabilité du succès d'alimentation ($R^2$ = `r summary(cond.best)$adj.r.squared`), même si presque toutes les variables incluses dans le modèle de départ restent significatives, sauf la salinité.  
+
+> On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale.  
+
+&nbsp;
+
+```{r condition mixed model}
+#--- modèles mixtes linéraires
+
+# Modèle complet
+cond.LMER.all <- lmerTest::lmer( fish_cond ~ log_indstandard         +
+                                             open_water_day          +
+                                             surf_temp_degC          +
+                                             log_NASC_zoo            +
+                                            (log_indstandard         +
+                                             open_water_day          +
+                                             surf_temp_degC          +
+                                             log_NASC_zoo            | region),
+                                 data = dfish.LMER )
+summary(cond.LMER.all)
+# => On peut enlever les variables explicatives avec les pentes les plus faibles et 
+#    les p-values non significatives :
+#    Enlever log_indstandard
+#    Enlever surf_temp_degC
+
+performance::icc(cond.LMER.all)
+# => part de variance dû au groupement = 54%
+
+lmerTest::ranova(cond.LMER.all)
+
+
+
+
+# Meilleur modèles
+cond.LMER.best <- lmerTest::lmer( fish_cond ~ log_indstandard         +
+                                              surf_temp_degC          +
+                                              open_water_day          +
+                                              log_NASC_zoo            +
+                                             (log_indstandard         +
+                                              surf_temp_degC  
+                                              | region),
+                                  data = dfish.LMER )
+summary(cond.LMER.best)
+
+
+performance::icc(cond.LMER.best)
+# => La part de variance expliquée par les groupes (région) est de 20.4%
+
+plot_model( cond.LMER.best, 
+            type = "diag" )
+# => les conditions d'application de la régression linéaire sont parfaitement respectées
+
+# Plot fixed effects
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_indstandard"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("open_water_day"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_NASC_zoo"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("surf_temp_degC"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_indstandard","region"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("open_water_day","region"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_NASC_zoo","region"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("surf_temp_degC","region"), 
+            show.data = TRUE )
+```
+
+&nbsp;
+
+
+
+&nbsp;
+
+# SANS MS 2010: Modèles de succès alimentaire
+
+## Succès alimentaire et environnement
+
+### Modèles de régression linéaire  
+
+&nbsp;
+
+On va établir les modèles de régression linéaire multiples pour essayer d'expliquer la variabilité du succès alimentaire des poissons échantillonnés.  
+
+Lorsque pertinent, nous utiliserons des modèles à effet mixtes aléatoires pour tenir compte de la forte hétérogénéité spatiale de notre échantillonnage.  
+
+&nbsp;
+
+```{r feeding simple model2}
+dfish_noMS2010 <- dfish %>% filter(dfish$region_year != "MS 2010") %>% droplevels(.$region_year)
+#--- Simple stepwise multiple regression model selection
+
+# modèle avec ordonnée à l'origine seulement
+feed.int2 <- lm( log_feeding_success ~ 1, data = dfish_noMS2010 )
+
+# modèle avec toutes les variables explicatives
+feed.all2 <- lm( log_feeding_success ~ log_indstandard         +
+                                      open_water_day          +
+                                      surf_sal_kgm3           +
+                                      surf_temp_degC          +
+                                      log_NASC_zoo, 
+                data = dfish_noMS2010 )
+
+# forward & backward stepwise selection
+feed.best2 <- step( feed.int2,
+                   direction = 'both',
+                   scope = formula(feed.all2) )
+
+# Vérifie les résultats de la procédure sur la séléction des variables
+show(feed.best2$anova)
+
+# => meilleur modèle ne garde que open_water_day, log_indstandard & log_NASC_zoo
+# => le R2 est un peu mieux qu'avec MS 2010 = 0.16 (vs. 0.10)
+summary(feed.best2)
+
+# Vérifie la colinéarité
+car::vif(feed.best2)
+
+# Vérifie les conditions d'application
+plot(feed.best2)
+```
+
+&nbsp;
+
+Les conditions environnementales expliquent mal la variabilité du succès d'alimentation.  
+
+Seulement l'abondance de **larves**, l'abondance de **macrozooplancton** révélée par l'acoustique et le **nombre de jours depuis la débâcle** des poissons explique 16 % de la variance observée ($R^2$ = `r summary(feed.best2)$adj.r.squared`)
+
+> On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale.  
+
+&nbsp;
+
+```{r feeding mixed model2}
+#--- modèles mixtes linéraires
+
+# Vérifie les relations par région
+lattice::xyplot( log_feeding_success ~ log_indstandard         | region, data = dfish_noMS2010 )
+lattice::xyplot( log_feeding_success ~ open_water_day          | region, data = dfish_noMS2010 )
+lattice::xyplot( log_feeding_success ~ log_NASC_zoo            | region, data = dfish_noMS2010 )
+
+# Supprime les régions "Amundsen Gulf Mouth" & "NEG" car PAS DE VARIANCE pour plusieurs variables !
+dfish.LMER2 <- dfish_noMS2010 %>% subset(., region!="Amundsen Gulf Mouth" & region!="NEG" )
+
+# Modèle complet
+fish.LMER.all2 <- lmerTest::lmer( log_feeding_success ~ log_indstandard         + 
+                                                       open_water_day          +
+                                                       log_NASC_zoo            +
+                                                      (log_indstandard         +
+                                                       open_water_day          +
+                                                       log_NASC_zoo           | region),
+                                 data = dfish.LMER2 )
+summary(fish.LMER.all2)
+
+performance::icc(fish.LMER.all2)
+# => le groupement par région explique 21.2% de la variance du succès d'alimentation
+
+lmerTest::ranova(fish.LMER.all2)
+# => montre quelles variables explicatives enlever des effets aléatoires :
+#    Enlever open_water_day améliore le modèle (AIC < & p-value >> 0.05)                     -> on enlève
+#    Enlever log_indstandard a un impact significatif (AIC > & p<<0.05)                     -> on garde
+#    Enlever log_NASC_zoo rend le modèle moins bien (AIC > & p-value << 0.05)       -> on garde
+
+# Meilleur modèle
+fish.LMER.best2 <- lmerTest::lmer( log_feeding_success ~ open_water_day         + 
+                                                        log_NASC_zoo            +
+                                                        log_indstandard         +
+                                                       (log_NASC_zoo + log_indstandard | region),
+                                  data = dfish.LMER2)
+summary(fish.LMER.best2)
+
+performance::icc(fish.LMER.best2)
+# => pas capable de calculer
+
+plot_model( fish.LMER.best2, 
+            type = "diag" )
+# => les conditions d'application de la régression linéaire sont parfaitement respectées
+
+# Plot fixed effects
+plot_model( fish.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("open_water_day"), 
+            show.data = TRUE )
+
+
+plot_model( fish.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_NASC_zoo"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_indstandard"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( fish.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("open_water_day","region"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_NASC_zoo","region"), 
+            show.data = TRUE )
+
+plot_model( fish.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_indstandard","region"), 
+            show.data = TRUE )
+```
+
+&nbsp;
+
+Ajouter les régions comme effet aléatoire est plus rigoureux d'un point de vue de l'analyse de nos résultats, et cela permet de tenir compte de la variabilité de l'effet des variables explicatives sur le succès alimentaire selon les régions, en particulier de la densité de zooplancton observée par l'acoustique et la densité de larves.
+
+&nbsp;
+
+## Condition et environnement
+
+&nbsp;
+
+### Modèles de régression linéaire  
+
+&nbsp;
+
+On va établir les modèles de régression linéaire multiples pour essayer d'expliquer la variabilité de l'indice de condition des poissons échantillonnés.  
+
+Lorsque pertinent, nous utiliserons des modèles à effet mixtes aléatoires pour tenir compte de la forte hétérogénéité spatiale de notre échantillonnage.  
+
+&nbsp;
+
+```{r condition simple model2}
+
+#--- Simple stepwise multiple regression model selection
+
+# modèle avec ordonnée à l'origine seulement
+cond.int2 <- lm( fish_cond ~ 1, data = dfish_noMS2010 )
+
+# modèle avec toutes les variables explicatives
+cond.all2 <- lm( fish_cond ~ log_indstandard         +
+                            open_water_day          +
+                            surf_sal_kgm3           +
+                            surf_temp_degC          +
+                            log_NASC_zoo, 
+                data = dfish_noMS2010 )
+
+# forward & backward stepwise selection
+cond.best2 <- step( cond.int2,
+                   direction = 'both',
+                   scope = formula(cond.all2) )
+
+# Vérifie les résultats de la procédure sur la séléction des variables
+show(cond.best2$anova)
+
+# => meilleur modèle n'enlève que surf_sal_kgm3
+# => le R2 est faible = 0.12
+summary(cond.best2)
+
+# Vérifie la colinéarité
+car::vif(cond.best2)
+
+# Vérifie les conditions d'application
+plot(cond.best2)
+```
+
+&nbsp;
+
+Les conditions environnementales expliquent mal la variabilité du succès d'alimentation ($R^2$ = `r summary(cond.best2)$adj.r.squared`), même si presque toutes les variables incluses dans le modèle de départ restent significatives, sauf la salinité.  
+
+> On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale.  
+
+&nbsp;
+
+```{r condition mixed model2}
+#--- modèles mixtes linéraires
+
+# Modèle complet
+cond.LMER.all2 <- lmerTest::lmer( fish_cond ~ log_indstandard         +
+                                             open_water_day          +
+                                             surf_temp_degC          +
+                                             log_NASC_zoo            +
+                                            (log_indstandard         +
+                                             open_water_day          +
+                                             surf_temp_degC          +
+                                             log_NASC_zoo            | region),
+                                 data = dfish.LMER2 )
+summary(cond.LMER.all2)
+
+performance::icc(cond.LMER.all2)
+# => part de variance dû au groupement = 58%
+
+lmerTest::ranova(cond.LMER.all2)
+
+
+
+
+# Meilleur modèles
+cond.LMER.best2 <- lmerTest::lmer( fish_cond ~ log_indstandard         +
+                                              surf_temp_degC          +
+                                              open_water_day          +
+                                              log_NASC_zoo            +
+                                             (log_indstandard         +
+                                              surf_temp_degC  
+                                              | region),
+                                  data = dfish.LMER2 )
+summary(cond.LMER.best2)
+
+
+performance::icc(cond.LMER.best2)
+# => La part de variance expliquée par les groupes (région) est de 20.4%!
+
+plot_model( cond.LMER.best2, 
+            type = "diag" )
+# => les conditions d'application de la régression linéaire sont parfaitement respectées
+
+# Plot fixed effects
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_indstandard"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("open_water_day"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_NASC_zoo"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("surf_temp_degC"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_indstandard","region"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("open_water_day","region"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_NASC_zoo","region"), 
+            show.data = TRUE )
+
+plot_model( cond.LMER.best2, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("surf_temp_degC","region"), 
+            show.data = TRUE )
+```
+
+
+
+# Section 3. Proies et succès alimentaire
+
+&nbsp;
+
+## Succès alimentaire et taille des proies
+
+&nbsp;
+
+On explore les relations possibles entre le succès alimentaire et la taille des proies des poissons.  
+
+&nbsp;
+
+```{r explo Question 3 proies}
+
+#--- Succès alimentaire et taille des proies
+
+dfish$total_preys <- rowSums(dfish[,c(23:86)])
+
+# On ajoute les variables log-transformées
+dfish$log_prey_max_um    <- log10(dfish$prey_max_um)
+dfish$log_prey_min_um    <- log10(dfish$prey_min_um)
+dfish$log_prey_median_um <- log10(dfish$prey_median_um)
+dfish$log_prey_range_um  <- log10(dfish$prey_range_um)
+dfish$log_total_preys    <- log10(dfish$total_preys)
+
+# Nuages de point
+dfish %>% select( log_feeding_success,
+                  log_prey_max_um,
+                  log_prey_min_um,
+                  log_prey_median_um,
+                  log_prey_range_um,
+                  log_total_preys ) %>% plot
+
+# Corrélations avec les variables explicatives potentielles
+rcorr( as.matrix( dfish[, c( "log_feeding_success",
+                             "log_prey_max_um",
+                             "log_prey_min_um",
+                             "log_prey_median_um",
+                             "log_prey_range_um",
+                             "log_total_preys" ) ]
+                 ) 
+      )
+
+# La seule corrélation non significative est avec log_prey_min_um
+# Il y a colinéarité entre log_prey_max_um et log_prey_range_um
+
+plot( feeding_success ~ prey_max_um,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_prey_max_um | region, data = dfish )
+
+plot( feeding_success ~ prey_median_um,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_prey_median_um | region, data = dfish )
+
+plot( feeding_success ~ total_preys,
+      data = dfish,
+      log  = 'xy',
+      pch  = 19,
+      col  = dfish$region ) 
+
+lattice::xyplot( log_feeding_success ~ log_total_preys | region, data = dfish )
+```
+
+&nbsp;
+
+### Modèles de régression linéaire  
+
+&nbsp;
+
+On va établir les modèles de régression linéaire multiples pour essayer d'expliquer la variabilité du succes d'alimentation des poissons échantillonnés selon les propriétés de leur alimentation.  
+
+&nbsp;
+
+```{r prey size simple model}
+
+#--- Simple stepwise multiple regression model selection
+
+# modèle avec ordonnée à l'origine seulement
+size.int <- lm( log_feeding_success ~ 1, data = dfish )
+
+# modèle avec toutes les variables explicatives
+size.all <- lm( log_feeding_success ~ log_prey_max_um    +
+                                      log_prey_median_um +
+                                      log_total_preys, 
+                data = dfish )
+
+# forward & backward stepwise selection
+size.best <- step( size.int,
+                   direction = 'both',
+                   scope = formula(size.all) )
+
+# Vérifie les résultats de la procédure sur la séléction des variables
+show(size.best$anova)
+
+# => meilleur modèle n'enlève que log_prey_max_um
+# => le R2 est moyen = 0.29
+summary(size.best)
+
+# Vérifie la colinéarité
+car::vif(size.best)
+
+# Vérifie les conditions d'application
+plot(size.best)
+```
+
+&nbsp;
+
+Les caractéristiques de taille et d'abondance des proies expliquent assez bien la variabilité du succès d'alimentation ($R^2$ = `r summary(size.best)$adj.r.squared`).  
+
+On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale.  
+
+&nbsp;
+
+```{r size mixed model}
+#--- modèles mixtes linéraires
+
+# Modèle complet
+size.LMER.all <- lmerTest::lmer( log_feeding_success ~ log_prey_median_um +
+                                                       log_total_preys    + 
+                                                      (log_prey_median_um +
+                                                       log_total_preys    | region),
+                                 data = dfish )
+summary(size.LMER.all)
+
+performance::icc(size.LMER.all)
+# => incapable de calculer la part de variance expliquée par les groupes (région)
+
+lmerTest::ranova(size.LMER.all)
+# => on peut enlever log_prey_median_um des effets aléatoires (AIC < & p-value > 0.05)
+
+# Meilleur modèle
+size.LMER.best <- lmerTest::lmer( log_feeding_success ~ log_prey_median_um +
+                                                        log_total_preys    + 
+                                                       (log_total_preys    | region),
+                                 data = dfish )
+summary(size.LMER.best)
+
+performance::icc(size.LMER.best)
+# => La part de variance expliquée par les groupes (région) est de 25%
+
+plot_model( size.LMER.best, 
+            type = "diag" )
+# => les conditions d'application de la régression linéaire sont parfaitement respectées
+
+# Plot fixed effects
+plot_model( size.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_prey_median_um"), 
+            show.data = TRUE )
+
+plot_model( size.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_total_preys"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( size.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_prey_median_um","region"), 
+            show.data = TRUE )
+
+plot_model( size.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_total_preys","region"), 
+            show.data = TRUE )
+```
+
+&nbsp;
+
+Ajouter les régions comme effet aléatoire permet de tenir compte de la variabilité de l'abondance totale de proies sur le succès alimentaire selon les régions.  
+
+&nbsp;
+
+## Succès alimentaire et composition des proies
+
+On vérifie la relation entre le «*feeding success*» et la **composition** des proies.  
+
+> PASCALE : pourquoi des matrices de présence/absence ?  
+
+```{r prey composition}
+#--- Create presence/absence prey matrix
+#prey_matrix_comb3 <- prey_matrix_comb2
+#prey_matrix_comb3[, c(1:11)] <- prey_matrix_comb3[, c(1:11)] %>% 
+#                                sapply(., as.logical)        %>% 
+#                                as.data.frame()              %>% 
+#                                sapply(., as.numeric)        %>% 
+#                                as.data.frame()
+
+prey_matrix_comb2$log_feeding_success        <- log10( prey_matrix_comb2$feeding_success )
+
+prey_matrix_comb2$log_appendicularia         <- log10( prey_matrix_comb2$appendicularia           +1 )
+prey_matrix_comb2$log_calanus.glacialis.c    <- log10( prey_matrix_comb2$`calanus glacialis c`    +1 )
+prey_matrix_comb2$log_calanus.sp.n           <- log10( prey_matrix_comb2$`calanus sp n`           +1 )
+prey_matrix_comb2$log_cyclopoidae.sp.c       <- log10( prey_matrix_comb2$`cyclopoidae sp c`       +1 )
+prey_matrix_comb2$log_egg                    <- log10( prey_matrix_comb2$egg                      +1 )
+prey_matrix_comb2$log_other                  <- log10( prey_matrix_comb2$other                    +1 )
+prey_matrix_comb2$log_other.calanoid.sp.c    <- log10( prey_matrix_comb2$`other calanoid sp c`    +1 )
+prey_matrix_comb2$log_other.calanus.sp.c     <- log10( prey_matrix_comb2$`other calanus sp c`     +1 )
+prey_matrix_comb2$log_other.copepodite.and.n <- log10( prey_matrix_comb2$`other copepodite and n` +1 )
+prey_matrix_comb2$log_pseudocalanus.sp.c     <- log10( prey_matrix_comb2$`pseudocalanus sp c`     +1 )
+prey_matrix_comb2$log_pseudocalanus.sp.n     <- log10( prey_matrix_comb2$`pseudocalanus sp n`     +1 )
+
+# modèle avec ordonnée à l'origine seulement
+prey.int <- lm( log_feeding_success ~ 1, data = prey_matrix_comb2 )
+
+# modèle avec toutes les variables explicatives
+prey.all <- lm( log_feeding_success ~ log_appendicularia         + 
+                                      log_calanus.glacialis.c    +
+                                      log_calanus.sp.n           + 
+                                      log_cyclopoidae.sp.c       + 
+                                      log_egg                    + 
+                                      log_other                  + 
+                                      log_other.calanoid.sp.c    + 
+                                      log_other.calanus.sp.c     + 
+                                      log_other.copepodite.and.n + 
+                                      log_pseudocalanus.sp.c     + 
+                                      log_pseudocalanus.sp.n, 
+                data = prey_matrix_comb2 )
+
+# forward & backward stepwise regression
+prey.best <- step( prey.int,
+                   direction = 'both',
+                   scope = formula(prey.all) )
+
+# Vérifie les résultats
+summary(prey.best)
+
+# => Le "meilleur" modèle conserve `calanus glacialis c`, `calanus sp n`, `other calanus sp c`, 
+#    `cyclopoidae sp c`, egg, `pseudocalanus sp c` & `other copepodite and n`
+
+# Vérifie la colinéarité
+car::vif(prey.best)
+
+# Vérifie les conditions d'application
+plot(prey.best)
+```
+
+&nbsp;
+
+Les caractéristiques taxonomiques des proies **expliquent bien** la variabilité du succès d'alimentation ($R^2$ = `r summary(prey.best)$adj.r.squared`).  
+
+On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale.  
+
+&nbsp;
+
+```{r prey mixed model}
+
+#--- modèle mixte
+
+# Vérifie les relations par région
+lattice::xyplot( log_feeding_success ~ log_calanus.sp.n           | region, data = prey_matrix_comb2 )
+lattice::xyplot( log_feeding_success ~ log_other.calanus.sp.c     | region, data = prey_matrix_comb2 )
+lattice::xyplot( log_feeding_success ~ log_calanus.glacialis.c    | region, data = prey_matrix_comb2 )
+lattice::xyplot( log_feeding_success ~ log_cyclopoidae.sp.c       | region, data = prey_matrix_comb2 )
+lattice::xyplot( log_feeding_success ~ log_egg                    | region, data = prey_matrix_comb2 )
+lattice::xyplot( log_feeding_success ~ log_pseudocalanus.sp.c     | region, data = prey_matrix_comb2 )
+lattice::xyplot( log_feeding_success ~ log_other.copepodite.and.n | region, data = prey_matrix_comb2 )
+
+# Supprime la région "NEG" car PAS DE VARIANCE pour plusieurs variables !
+#prey_matrix_comb2.LMER <- prey_matrix_comb2 %>% subset(., region!="NEG" )
+
+# Modèle complet
+prey.LMER <- lmerTest::lmer( log_feeding_success ~ log_calanus.glacialis.c    +
+                                                   log_calanus.sp.n           + 
+                                                   log_cyclopoidae.sp.c       + 
+                                                   log_egg                    + 
+                                                   log_other.calanus.sp.c     + 
+                                                   log_other.copepodite.and.n + 
+                                                   log_pseudocalanus.sp.c     + 
+                                                  (log_calanus.glacialis.c    +
+                                                   log_calanus.sp.n           + 
+                                                   log_cyclopoidae.sp.c       + 
+                                                   log_egg                    + 
+                                                   log_other.calanus.sp.c     + 
+                                                   log_other.copepodite.and.n + 
+                                                   log_pseudocalanus.sp.c     | region),
+                               data = prey_matrix_comb2 )
+summary(prey.LMER)
+# => l'effet fixe de log_other.copepodite.and.n n'est pas significatif
+
+performance::icc(prey.LMER)
+# => incapable de calculer la part de variance expliquée par les groupes (région)
+
+lmerTest::ranova(prey.LMER)
+# => on pourrait retirer toutes les variables des effets aléatoires (AIC <, p-value >> 0.05), SAUF log_calanus.sp.n (AIC >, p-value << 0.05)
+
+prey.LMER.best <- lmerTest::lmer( log_feeding_success ~ log_calanus.glacialis.c    +
+                                                        log_calanus.sp.n           + 
+                                                        log_cyclopoidae.sp.c       + 
+                                                        log_egg                    + 
+                                                        log_other.calanus.sp.c     + 
+                                                        log_pseudocalanus.sp.c     + 
+                                                       (log_calanus.sp.n           | region),
+                               data = prey_matrix_comb2 )
+summary(prey.LMER.best)
+
+performance::icc(prey.LMER.best)
+# => la part de variance expliquée par les groupes (région) est de 31%
+
+# Check assumptions
+plot_model( prey.LMER.best, 
+            type = "diag" )
+
+# Plot fixed effects
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_calanus.glacialis.c"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_calanus.sp.n"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_cyclopoidae.sp.c"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_egg"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_other.calanus.sp.c"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_pseudocalanus.sp.c"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_calanus.glacialis.c","region"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_calanus.sp.n","region"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_cyclopoidae.sp.c","region"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_egg","region"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_other.calanus.sp.c","region"), 
+            show.data = TRUE )
+
+plot_model( prey.LMER.best, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_pseudocalanus.sp.c","region"), 
+            show.data = TRUE )
+```
+
+
+&nbsp;
+
+Ajouter les régions comme effet aléatoire permet de tenir compte de la variabilité de l'abondance des nauplii de *Calanus* sp parmi les proies sur le succès alimentaire selon les régions.  
+
+&nbsp;
+
+## Condition et composition des proies
+
+On vérifie la relation entre la **condition** et la **composition** des proies.  
+
+```{r condition & prey composition}
+
+# modèle avec ordonnée à l'origine seulement
+cond.prey.int <- lm( fish_cond ~ 1, data = prey_matrix_comb2 )
+
+# modèle avec toutes les variables explicatives
+cond.prey.all <- lm( fish_cond ~ log_appendicularia         + 
+                                 log_calanus.glacialis.c    +
+                                 log_calanus.sp.n           + 
+                                 log_cyclopoidae.sp.c       + 
+                                 log_egg                    + 
+                                 log_other                  + 
+                                 log_other.calanoid.sp.c    + 
+                                 log_other.calanus.sp.c     + 
+                                 log_other.copepodite.and.n + 
+                                 log_pseudocalanus.sp.c     + 
+                                 log_pseudocalanus.sp.n, 
+                      data = prey_matrix_comb2 )
+
+# forward & backward stepwise regression
+cond.prey.best <- step( cond.prey.int,
+                        direction = 'both',
+                        scope = formula(cond.prey.all) )
+
+# Vérifie les résultats
+summary(cond.prey.best)
+
+# => Le "meilleur" modèle ne conserve que log_pseudocalanus.sp.c, log_other.copepodite.and.n & log_egg
+#    LE R2 est très faible = 0.07
+
+# Vérifie la colinéarité
+car::vif(cond.prey.best)
+
+# Vérifie les conditions d'application
+plot(cond.prey.best)
+```
+
+&nbsp;
+
+Contrairement au succès alimentaire, les caractéristiques taxonomiques des proies **n'expliquent PAS bien** la variabilité de l'indice de condition des poissons ($R^2$ = `r summary(cond.prey.best)$adj.r.squared`).  
+
+Ceci est probablement dû au fait que la condition est une mesure intégratrice des conditions de vie rencontrée par l'individu.  
+
+On va maintenant vérifier avec des **modèles mixtes** l'influence possible de l'hétérogénéité régionale, bien que ce ne soit pas très intéressant...  
+
+&nbsp;
+
+```{r condition prey mixed model}
+
+#--- modèle mixte
+
+# Vérifie les relations par région
+lattice::xyplot( fish_cond ~ log_egg                    | region, data = prey_matrix_comb2 )
+lattice::xyplot( fish_cond ~ log_pseudocalanus.sp.c     | region, data = prey_matrix_comb2 )
+lattice::xyplot( fish_cond ~ log_other.copepodite.and.n | region, data = prey_matrix_comb2 )
+
+# Supprime la région "NEG" car PAS DE VARIANCE pour plusieurs variables !
+#prey_matrix_comb2.LMER <- prey_matrix_comb2 %>% subset(., region!="NEG" )
+
+# Modèle complet
+cond.prey.LMER <- lmerTest::lmer( fish_cond ~ log_egg                    + 
+                                              log_other.copepodite.and.n + 
+                                              log_pseudocalanus.sp.c     + 
+                                             (log_egg                    + 
+                                              log_other.copepodite.and.n + 
+                                              log_pseudocalanus.sp.c     | region),
+                                  data = prey_matrix_comb2 )
+summary(cond.prey.LMER)
+# => aucun effet fixe n'est significatif
+
+performance::icc(cond.prey.LMER)
+# => incapable de calculer la part de variance expliquée par les groupes (région)
+
+lmerTest::ranova(cond.prey.LMER)
+# => on pourrait retirer toutes les variables des effets aléatoires (AIC <, p-value >> 0.05)
+
+cond.prey.LMER <- lmerTest::lmer( fish_cond ~ log_egg                    + 
+                                              log_other.copepodite.and.n + 
+                                              log_pseudocalanus.sp.c     + 
+                                             ( 1 | region),
+                                  data = prey_matrix_comb2 )
+summary(cond.prey.LMER)
+# => seul l'effet fixe lié à log_pseudocalanus.sp.c est significatif !
+
+performance::icc(cond.prey.LMER)
+# => la part de variance expliquée par les groupes (région) est de 14%
+
+# Check assumptions
+plot_model( cond.prey.LMER, 
+            type = "diag" )
+
+# Plot fixed effects
+plot_model( cond.prey.LMER, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_egg"), 
+            show.data = TRUE )
+
+plot_model( cond.prey.LMER, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_other.copepodite.and.n"), 
+            show.data = TRUE )
+
+plot_model( cond.prey.LMER, 
+            type = "pred", 
+            pred.type = "fe", 
+            terms = c("log_pseudocalanus.sp.c"), 
+            show.data = TRUE )
+
+# Plot random effect
+plot_model( cond.prey.LMER, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_egg","region"), 
+            show.data = TRUE )
+
+plot_model( cond.prey.LMER, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_other.copepodite.and.n","region"), 
+            show.data = TRUE )
+
+plot_model( cond.prey.LMER, 
+            type = "pred", 
+            pred.type = "re", 
+            terms = c("log_pseudocalanus.sp.c","region"), 
+            show.data = TRUE )
+```
+
+
+&nbsp;
+
+Ajouter les régions comme effet aléatoire n'apporte aucune information supplémentaire pour comprendre la variabilité de l'indice de condition des poissons. 
+
+***
+
+```{r prey occurence, echo = FALSE, eval = FALSE}
+freqtable <- as.data.frame(table(gutcontent2$prey_id_comb,gutcontent2$region))
+freqtable$Var2 <- ordered(freqtable$Var2, c("Mackenzie Shelf", "Amundsen Gulf Mouth", "Coronation Maud", "Larsen Sound - Victoria Strait", "Peel Sound", "Lancaster Sound", "North Water", "West Baffin Bay", "NEG"))
+color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+colours_bar <- sample(color, size =15)
+ggplot() +
+  geom_bar(data =freqtable, mapping = aes(fill=Var1, y=Freq, x=Var2), position="fill", stat="identity") +
+  scale_fill_manual(values =colours_bar)
+
+freqtable2 <- as.data.frame(table(gutcontent2$prey_id_comb,gutcontent2$station))
+ggplot() +
+  geom_bar(data =freqtable2, mapping = aes(fill=Var1, y=Freq, x=Var2), position="fill", stat="identity") +
+  scale_fill_manual(values =colours_bar)
+
+carbon_input <- aggregate(carbon_mg ~ prey_id_comb + region, data = gutcontent2, FUN = sum)
+ggplot() +
+  geom_bar(data =carbon_input, mapping = aes(fill=prey_id_comb, y=carbon_mg, x=region), position="fill", stat="identity") +
+  scale_fill_manual(values =colours_bar) + 
+  labs(x = "", y = "")
+
+carbon_input2 <- aggregate(carbon_mg ~ prey_id_comb + station, data = gutcontent2, FUN = sum)
+ggplot() +
+  geom_bar(data =carbon_input2, mapping = aes(fill=prey_id_comb, y=carbon_mg, x=station), position="fill", stat="identity") +
+  scale_fill_manual(values =colours_bar) 
+
+#en gros, bouffer des calanus = payant à souhait
+```
+
+
+
